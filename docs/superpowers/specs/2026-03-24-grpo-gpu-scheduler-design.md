@@ -16,6 +16,13 @@ GRPO（Group Relative Policy Optimization）多轮强化学习的推理阶段存
    - 从哪些任务回收多少张卡
    - 将回收的空闲卡分配给哪些任务
 
+### 1.1 重要设计约束补充
+
+1. **历史数据不确定性**：每个任务的历史平均每轮耗时、总耗时受到总卡数、并行策略等配置的影响，不一定能拿到准确值
+2. **并行策略多样性**：每个任务的并行策略（tp/pp）不一样，但都是2的倍数
+3. **拓扑感知**：一个tp组尽可能要放在同一台机器上，否则推理时延会非常高，而且预测也不准
+4. **回收决策下放**：当中心调度器决策要回收某个任务的几张卡时，让任务本身来决定回收哪几张卡
+
 ## 2. 优化目标
 
 1. **约束条件**：每个强化学习训练任务的端到端耗时不能比固定分配时更长
@@ -29,11 +36,17 @@ GRPO（Group Relative Policy Optimization）多轮强化学习的推理阶段存
 - `T_i`：第i个任务
 - `K_i^base`：任务i的固定分配基准实例数
 - `K_i(t)`：时刻t任务i的实际实例数
-- `tp_i`：任务i的tensor parallelism
-- `pp_i`：任务i的pipeline parallelism
+- `tp_i`：任务i的tensor parallelism（2的幂）
+- `pp_i`：任务i的pipeline parallelism（2的幂）
 - `cards_per_instance_i = tp_i * pp_i`：每个实例需要的卡数
 - `K_i^min = 1`：最小保证实例数
 - `S_per_round_i`：每轮固定处理的样本数（任务启动时确定）
+
+**集群拓扑**：
+- `M_m`：第m台机器
+- `G_{m,g}`：机器m上的第g张GPU
+- `Placement_{i,j}`：任务i的第j个实例的GPU放置（机器ID列表，长度为tp_i）
+- `ColocalityScore(Placement)`：放置的拓扑分数（同一机器的GPU越多分数越高）
 
 **时间指标**（按阶段）：
 - `τ_wt_i`：权重传输时间
@@ -65,6 +78,12 @@ GRPO（Group Relative Policy Optimization）多轮强化学习的推理阶段存
 
 ### 3.2 基准耗时模型（固定分配时）
 
+**重要说明**：由于历史平均每轮耗时受到总卡数、并行策略等配置影响，不一定能拿到准确值。我们采用**保守估计策略**：
+
+1. 如果有基准分配下的历史数据，用历史数据
+2. 如果没有，用当前观测到的最快轮次作为基准下界
+3. 当数据不足时，倾向于不回收GPU（保守策略）
+
 单轮完整耗时（基准分配 `K_i^base` 个实例）：
 
 ```
@@ -75,9 +94,12 @@ GRPO（Group Relative Policy Optimization）多轮强化学习的推理阶段存
 - `τ_rollout_round_i^base`：基准分配下，整轮rollout的耗时（所有实例完成的时间，即长尾时间）
 - `τ_non_rollout_i = max(τ_rlp_i, τ_rwd_i) + τ_adv_i + τ_upd_i`
 
-基准总耗时（用历史平均每轮耗时）：
+基准总耗时：
 ```
-τ_round_avg_i^base = 历史平均每轮耗时（固定分配下）
+如果有历史数据:
+  τ_round_avg_i^base = 历史平均每轮耗时（固定分配下）
+否则:
+  τ_round_avg_i^base = min(观测到的所有轮次耗时)  # 保守估计
 T_total_i^base = R_total_i * τ_round_avg_i^base
 ```
 
@@ -85,6 +107,10 @@ T_total_i^base = R_total_i * τ_round_avg_i^base
 ```
 T_rem_i^base = R_rem_i * τ_round_avg_i^base
 ```
+
+**数据不足时的降级策略**：
+- 当历史轮次 < 3：不回收任何GPU，只分配空闲GPU
+- 当历史轮次 < 5：回收时加倍边际损失（更保守）
 
 ### 3.3 欠债追踪 - 性能约束保证
 
@@ -132,10 +158,15 @@ T_elapsed_i + T_rem_i(K_i^base) + max(Debt_i, 0) ≤ T_total_i^base
 3. **任务加入事件**：新任务提交到集群
 4. **任务退出事件**：某个任务完成退出
 
-### 4.2 调度决策算法（贪心边际收益）
+### 4.2 调度决策算法（贪心边际收益 + 拓扑感知）
 
 ```
 函数 Schedule():
+  # 步骤0: 检查历史数据充分性
+  for each task i:
+    i.has_sufficient_history = (i.done_rounds >= 3)
+    i.very_sufficient_history = (i.done_rounds >= 5)
+
   # 步骤1: 约束检查 - 确保所有任务即使现在开始只保留基准分配也能按时完成
   for each task i:
     if not CheckConstraint(i):
@@ -145,13 +176,22 @@ T_elapsed_i + T_rem_i(K_i^base) + max(Debt_i, 0) ≤ T_total_i^base
       if K_i < K_i^base:
         NeedToRestore[i] = K_i^base - K_i
     else:
-      i.can_reclaim = (K_i > K_i^min)  # 至少保留1个实例
+      # 历史数据不足时更保守
+      if i.has_sufficient_history:
+        i.can_reclaim = (K_i > K_i^min)  # 至少保留1个实例
+      else:
+        i.can_reclaim = (K_i > K_i^base)  # 数据不足时只回收超过基准的部分
 
   # 步骤2: 收集可回收的GPU
   Reclaimable = []
   for each task i where i.can_reclaim:
     # 计算从这个任务回收1个实例的边际"损失"
     loss_i = ComputeMarginalLoss(i)
+
+    # 历史数据不足时加倍损失（更保守）
+    if not i.very_sufficient_history:
+      loss_i *= 2.0
+
     Reclaimable.append( (loss_i, i) )
 
   # 按损失从小到大排序（先回收损失最小的）
@@ -171,13 +211,14 @@ T_elapsed_i + T_rem_i(K_i^base) + max(Debt_i, 0) ≤ T_total_i^base
   for each task i in NeedToRestore:
     while NeedToRestore[i] > 0 and (C_free > 0 or Reclaimable not empty):
       if C_free >= cards_per_instance_i:
-        # 有空闲GPU，直接分配
-        Allocate(i, 1)
+        # 有空闲GPU，直接分配（考虑拓扑）
+        placement = FindBestPlacement(i, free_gpus)
+        Allocate(i, 1, placement)
         NeedToRestore[i] -= 1
       else:
         # 需要回收
         (loss, j) = Reclaimable.pop(0)
-        Reclaim(j, 1)
+        Reclaim(j, 1)  # 只是通知任务回收1个实例，任务自己决定回收哪几个
 
   # 步骤5: 贪心分配 - 把回收/空闲的GPU分配给收益最高的任务
   while C_free > 0 or Reclaimable not empty:
@@ -194,12 +235,14 @@ T_elapsed_i + T_rem_i(K_i^base) + max(Debt_i, 0) ≤ T_total_i^base
     cards_needed = cards_per_instance_i
 
     if C_free >= cards_needed:
-      # 有空闲GPU，直接分配
-      Allocate(i, 1)
-      # 重新计算这个任务的下一个边际收益
-      new_gain = ComputeMarginalGain(i)
-      if new_gain > 0:
-        insert (-new_gain, i) into GainCandidates in sorted order
+      # 有空闲GPU，直接分配（考虑拓扑）
+      placement = FindBestPlacement(i, free_gpus)
+      if placement is not None:
+        Allocate(i, 1, placement)
+        # 重新计算这个任务的下一个边际收益
+        new_gain = ComputeMarginalGain(i)
+        if new_gain > 0:
+          insert (-new_gain, i) into GainCandidates in sorted order
     else:
       # 需要看回收是否划算
       if Reclaimable is empty:
@@ -210,21 +253,78 @@ T_elapsed_i + T_rem_i(K_i^base) + max(Debt_i, 0) ≤ T_total_i^base
       # 只有当 gain_i > loss_j + 切换开销 时才值得做
       if gain_i > loss_j + τ_wt_i:
         (loss_j, j) = Reclaimable.pop(0)
+        # 通知任务j回收1个实例 - 任务自己决定回收哪几个
         Reclaim(j, 1)
         # 现在应该有GPU了，分配给i
-        Allocate(i, 1)
-        # 重新计算i的下一个边际收益
-        new_gain = ComputeMarginalGain(i)
-        if new_gain > 0:
-          insert (-new_gain, i) into GainCandidates in sorted order
-        # 重新计算j的下一个边际损失
-        if j.can_reclaim:
-          new_loss = ComputeMarginalLoss(j)
-          insert (new_loss, j) into Reclaimable in sorted order
+        placement = FindBestPlacement(i, free_gpus)
+        if placement is not None:
+          Allocate(i, 1, placement)
+          # 重新计算i的下一个边际收益
+          new_gain = ComputeMarginalGain(i)
+          if new_gain > 0:
+            insert (-new_gain, i) into GainCandidates in sorted order
+          # 重新计算j的下一个边际损失
+          if j.can_reclaim:
+            new_loss = ComputeMarginalLoss(j)
+            if not j.very_sufficient_history:
+              new_loss *= 2.0
+            insert (new_loss, j) into Reclaimable in sorted order
       else:
         # 不划算，停止
         break
 ```
+
+### 4.3 拓扑感知的放置算法
+
+**FindBestPlacement(task_i, free_gpus)**: 为任务i找到最佳GPU放置
+
+```
+函数 FindBestPlacement(task_i, free_gpus):
+  # 需要 tp_i 张GPU组成一个实例
+  required = task_i.tp_i
+
+  # 按机器分组空闲GPU
+  free_by_machine = GroupByMachine(free_gpus)
+
+  best_placement = None
+  best_score = -infinity
+
+  # 策略1: 优先找同一台机器上有足够GPU的
+  for machine m in free_by_machine:
+    if len(free_by_machine[m]) >= required:
+      # 同一机器有足够GPU，完美放置
+      placement = PickGPUsFromMachine(m, required)
+      score = ColocalityScore(placement)  # 满分
+      return placement
+
+  # 策略2: 找跨机器但机器数最少的
+  for candidate_placement in GenerateCandidatePlacements(free_gpus, required):
+    score = ColocalityScore(candidate_placement)
+    if score > best_score:
+      best_score = score
+      best_placement = candidate_placement
+
+  return best_placement
+
+函数 ColocalityScore(placement):
+  # 计算放置的拓扑分数
+  # 同一机器的GPU越多分数越高
+  machine_counts = CountMachines(placement)
+  max_in_one_machine = max(machine_counts.values())
+  return max_in_one_machine / len(placement)  # 0-1之间，越高越好
+```
+
+### 4.4 回收决策下放
+
+当调度器决定从任务j回收1个实例时：
+
+1. 调度器只发送：`请回收1个实例`
+2. 任务Agent自己决定回收哪1个实例：
+   - 优先回收空闲实例
+   - 如果没有空闲实例，优先回收最慢的实例
+   - 确保剩下的实例有良好的拓扑放置
+
+**调度器不关心具体回收哪几张卡，只关心数量。**
 
 ### 4.3 关键函数定义
 
@@ -358,19 +458,91 @@ T_elapsed_i + T_rem_i(K_i^base) + max(Debt_i, 0) ≤ T_total_i^base
   return fastest > tail_ratio_threshold * slowest
 ```
 
-## 5. 系统架构与接口
+## 5. 补充设计说明
 
-### 5.1 系统架构
+### 5.1 处理历史数据不确定性
+
+由于历史平均耗时受配置影响，不一定准确，我们采用**保守策略**：
+
+| 历史轮次数 | 策略 |
+|-----------|------|
+| 0-2轮 | 不回收GPU，只分配空闲GPU |
+| 3-4轮 | 可以回收，但边际损失 × 2 |
+| ≥5轮 | 正常调度 |
+
+**设计理由**：数据不足时，错误决策的风险很高，宁愿不优化也不要让任务变慢。
+
+---
+
+### 5.2 处理并行策略多样性
+
+每个任务的tp/pp可以不同，但都是2的幂：
+
+- 调度器支持异构任务
+- 分配时检查任务i的 `cards_per_instance_i = tp_i * pp_i`
+- GPU池必须能被各种 `cards_per_instance_i` 分配
+
+---
+
+### 5.3 拓扑感知设计
+
+**核心原则**：一个tp组尽可能放在同一台机器上。
+
+**设计决策**：
+1. 调度器维护集群拓扑状态：哪些GPU在同一台机器
+2. 分配时调用 `FindBestPlacement()` 找最佳放置
+3. 优先同一机器 → 最少跨机器 → 任意放置
+4. 如果找不到满足拓扑要求的放置，拒绝分配（而不是分配坏的放置）
+
+**ColocalityScore计算**：
+```
+score = (同一机器上的最大GPU数) / tp_i
+范围: [0, 1]，1表示所有GPU在同一机器
+```
+
+---
+
+### 5.4 回收决策下放
+
+**责任划分**：
+
+| 组件 | 决策内容 |
+|------|---------|
+| 全局调度器 | 从哪个任务回收、回收几个实例 |
+| 任务Agent | 回收具体哪几个实例、哪几张卡 |
+
+**任务Agent的回收优先级**：
+1. 优先回收**空闲实例**（idle_instances）
+2. 其次回收**最慢的实例**（长尾制造者）
+3. 确保剩下的实例有良好的拓扑
+
+**通信流程**：
+```
+调度器 → 任务Agent: "请回收1个实例"
+任务Agent → 调度器: "已回收，具体是这几张卡：[...]"
+```
+
+---
+
+## 6. 系统架构与接口
+
+### 6.1 系统架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         全局调度器                               │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
-│  │  状态管理器      │  │  调度决策引擎    │  │  欠债追踪器  │ │
-│  │  - 任务状态      │  │  - 约束检查      │  │  - Debt_i    │ │
-│  │  - GPU池状态     │  │  - 收益/损失计算 │  │  - Slack_i   │ │
-│  └──────────────────┘  └──────────────────┘  └──────────────┘ │
-└────────┬────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           全局调度器                                       │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐ │
+│  │  状态管理器      │  │  调度决策引擎    │  │  欠债追踪器          │ │
+│  │  - 任务状态      │  │  - 约束检查      │  │  - Debt_i            │ │
+│  │  - GPU池状态     │  │  - 收益/损失计算 │  │  - Slack_i           │ │
+│  │  - 机器拓扑      │  │  - 历史数据检查   │  │                      │ │
+│  └──────────────────┘  └──────────────────┘  └──────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    拓扑放置管理器                                  │   │
+│  │  - FindBestPlacement()                                          │   │
+│  │  - ColocalityScore()                                            │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└────────┬─────────────────────────────────────────────────────────────────┘
          │
          │  RPC / gRPC
          │
@@ -381,29 +553,27 @@ T_elapsed_i + T_rem_i(K_i^base) + max(Debt_i, 0) ≤ T_total_i^base
 │  │  - 阶段耗时 │  │  │  │  - 阶段耗时 │  │  │  │  - 阶段耗时 │  │
 │  │  - 实例状态 │  │  │  │  - 实例状态 │  │  │  │  - 实例状态 │  │
 │  │  - 样本进度 │  │  │  │  - 样本进度 │  │  │  │  - 样本进度 │  │
+│  │  - GPU位置   │  │  │  │  - GPU位置   │  │  │  │  - GPU位置   │  │
 │  └─────────────┘  │  │  └─────────────┘  │  │  └─────────────┘  │
 │  ┌─────────────┐  │  │  ┌─────────────┐  │  │  ┌─────────────┐  │
 │  │ GPU管理器   │  │  │  │ GPU管理器   │  │  │  │ GPU管理器   │  │
 │  │ - 权重加载  │  │  │  │ - 权重加载  │  │  │  │ - 权重加载  │  │
 │  │ - 实例启停  │  │  │  │ - 实例启停  │  │  │  │ - 实例启停  │  │
+│  │ - 回收决策  │  │  │  │ - 回收决策  │  │  │  │ - 回收决策  │  │
 │  └─────────────┘  │  │  └─────────────┘  │  │  └─────────────┘  │
 └────────────────────┘  └────────────────────┘  └────────────────────┘
 ```
 
-### 5.2 Protobuf 接口定义
+### 6.2 Protobuf 接口定义
 
 ```protobuf
-// 任务配置
-message TaskConfig {
-  string task_id = 1;
-  int32 base_instances = 2;      // K_i^base
-  int32 tp = 3;
-  int32 pp = 4;
-  int32 samples_per_round = 5;   // S_per_round_i
-  int32 total_samples = 6;        // S_total_i
+// GPU位置信息
+message GPUPlacement {
+  int32 gpu_id = 1;
+  int32 machine_id = 2;
 }
 
-// 单个推理实例的状态
+// 单个推理实例的完整状态
 message InstanceState {
   int32 instance_id = 1;
   bool is_busy = 2;
@@ -412,6 +582,19 @@ message InstanceState {
   double elapsed_time_sec = 3;    // τ_elapsed_j
   int32 done_samples = 4;          // S_done_j
   int32 remaining_samples = 5;     // S_rem_j
+
+  // GPU放置信息
+  repeated GPUPlacement gpus = 6;   // 这个实例占用的GPU
+}
+
+// 任务配置
+message TaskConfig {
+  string task_id = 1;
+  int32 base_instances = 2;      // K_i^base
+  int32 tp = 3;                    // 2的幂
+  int32 pp = 4;                    // 2的幂
+  int32 samples_per_round = 5;   // S_per_round_i
+  int32 total_samples = 6;        // S_total_i
 }
 
 // 各阶段耗时指标
@@ -451,17 +634,30 @@ message TaskStateReport {
   double avg_round_sec_base = 9;
 }
 
+// 调度决策：为单个任务的分配
+message TaskAllocation {
+  string task_id = 1;
+
+  // 目标实例数（调度器只决定数量）
+  int32 target_instances = 2;
+
+  // 推荐的GPU放置（任务可以选择不遵守）
+  repeated GPUPlacement recommended_gpus = 3;
+}
+
 // 调度决策
 message SchedulingDecision {
-  message Allocation {
-    string task_id = 1;
-    int32 target_instances = 2;  // 目标实例数
-  }
-
-  repeated Allocation allocations = 1;
+  repeated TaskAllocation allocations = 1;
 
   // 决策时间戳
   double timestamp_sec = 2;
+}
+
+// 任务Agent上报：回收确认
+message ReclaimConfirm {
+  string task_id = 1;
+  int32 reclaimed_instances = 2;
+  repeated GPUPlacement reclaimed_gpus = 3;  // 具体回收了哪些GPU
 }
 
 // 调度器服务
@@ -477,7 +673,7 @@ service GlobalScheduler {
 }
 ```
 
-## 6. 调优参数
+## 7. 调优参数
 
 | 参数名 | 推荐初始值 | 说明 |
 |--------|-----------|------|
@@ -488,7 +684,7 @@ service GlobalScheduler {
 | `min_allocation_duration` | 300秒 | 最小分配持续时间 |
 | `tail_ratio_threshold` | 2.0 | 判断长尾的快慢比例阈值 |
 
-## 7. 边界情况处理
+## 8. 边界情况处理
 
 **新任务加入**：
 - 初始分配给它 `K_i^base` 个实例（如果有足够GPU）
@@ -513,7 +709,7 @@ service GlobalScheduler {
 - 在 `ComputeMarginalGain` 中减去切换开销 `τ_wt_i`
 - 设置"切换成本阈值"
 
-## 8. 可观测性
+## 9. 可观测性
 
 **调度器级别监控**：
 - 调度决策频率
@@ -527,7 +723,7 @@ service GlobalScheduler {
 - 每个任务的实际耗时 vs 基准耗时
 - 每个任务的长尾因子时间序列
 
-## 9. 降级模式
+## 10. 降级模式
 
 如果调度器出现问题，可以降级到：
 1. **固定分配模式**：回到基准，不再动态调整
