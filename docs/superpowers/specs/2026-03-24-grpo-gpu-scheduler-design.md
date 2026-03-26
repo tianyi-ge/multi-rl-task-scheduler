@@ -23,395 +23,351 @@ GRPO（Group Relative Policy Optimization）多轮强化学习的推理阶段存
 3. **拓扑感知**：一个tp组尽可能要放在同一台机器上，否则推理时延会非常高
 4. **回收决策下放**：当中心调度器决策要回收某个任务的几张卡时，让任务本身来决定回收哪几张卡
 
-### 1.2 核心设计原则
+### 1.2 核心不变量
 
-**关键洞察**：
-1. 历史平均端到端耗时往往缺失，无法用它准确衡量任务是否落后
-2. `EstimateFutureRoundTime` 很难估计准确，会导致边际损失/收益预估不准确
-3. 但我们可以明确知道每个任务的基线 `K_i^base`
+```python
+assert not (S_rem_i > 0 and K_i^idle > 0)
+```
 
-**可靠信号**：
-- 当任务剩余样本用不满 `K_i^base` 个实例时，实例可以释放
-- 当任务的每个实例都很忙、且还有剩余样本没推完、且当前实例数 `< K_i^base`，任务必须上报 `needs_more_instances = true`，调度器必须给它增加实例到 `K_i^base`
+**含义**：任务自己会管理好实例，当还有剩余样本时不会让实例空闲。
 
-**长尾的正确定义**：
-- 不是"实例间完成样本数差异大"（因为每个样本推理时间本来就不同）
-- 而是"部分实例已经没有样本可取了，而其他实例还在执行推理"
-- 注意：此时给长尾任务增加实例是**不合理**的，因为本轮样本已经分配完了
+---
 
-## 2. 优化目标
+## 2. 调度核心流程
 
-1. **约束条件**：每个强化学习训练任务的端到端耗时不能比固定分配时更长
-2. **优化目标**：尽可能让所有训练任务的平均端到端耗时最低
+每次触发group scheduler调度会有以下四个阶段：
 
-## 3. 核心概念
+```python
+delta_card_ranges = assess_range(task_states)
+plan, excess_cards = dont_starve(delta_card_ranges)
+if excess_cards:
+    plan = feed_more(delta_card_ranges, plan, excess_cards)
+execute(plan)
+```
 
-### 3.1 符号定义
+### 2.1 符号定义
 
 **任务级指标**：
 - `T_i`：第i个任务
-- `K_i^base`：任务i的固定分配基准实例数（核心基线，可靠）
+- `K_i^base`：任务i的固定分配基准实例数
 - `K_i(t)`：时刻t任务i的实际实例数
+- `K_i^idle(t)`：空闲实例数
+- `K_i^busy(t)`：忙实例数（`K_i - K_i^idle`）
 - `tp_i`：任务i的tensor parallelism（2的幂）
 - `pp_i`：任务i的pipeline parallelism（2的幂）
 - `cards_per_instance_i = tp_i * pp_i`：每个实例需要的卡数
-- `K_i^min = 1`：最小保证实例数
-- `S_per_round_i`：每轮固定处理的样本数（任务启动时确定）
+- `S_rem_i`：剩余样本数
 
 **集群拓扑**：
 - `M_m`：第m台机器
 - `G_{m,g}`：机器m上的第g张GPU
-- `Placement_{i,j}`：任务i的第j个实例的GPU放置（机器ID列表，长度为tp_i）
-- `ColocalityScore(Placement)`：放置的拓扑分数（同一机器的GPU越多分数越高）
 
-**进度指标**：
-- `S_total_i`：任务i的总样本数
-- `S_done_i`：已完成样本数
-- `S_rem_i = S_total_i - S_done_i`：剩余样本数
-- `R_done_i`：已完成轮次数
-- `R_total_i = ceil(S_total_i / S_per_round_i)`：总轮次数
-- `R_rem_i = R_total_i - R_done_i`：剩余轮次数
-- `InRolloutPhase(i)`：是否处于推理阶段（任务上报）
+---
 
-**当前状态指标**：
-- `K_i_idle(t)`：时刻t任务i的空闲实例数（已完成当前轮次的推理）
-- `K_i_busy(t) = K_i(t) - K_i_idle(t)`：忙实例数（仍在推理中）
-- `needs_more_instances`：任务主动上报的信号（需要更多实例到K_i^base）
-- `can_release_instances`：任务主动上报的信号（有空闲实例可以释放）
+## 3. 阶段一：assess_range() - 评估增减范围
 
-### 3.2 任务侧信号生成逻辑
+计算每个任务的GPU卡数调整范围。
 
-**任务Agent自己决定何时上报信号**：
+```python
+def assess_range(task_states):
+    """
+    计算每个任务的卡数调整范围 [min_cards, max_cards]
 
-```
-函数 TaskShouldRequestMoreInstances():
-  # 当满足以下所有条件时，设置 needs_more_instances = true
-  if InRolloutPhase(i) and
-     K_i < K_i^base and
-     K_i_idle == 0 and           # 所有实例都在忙
-     S_rem_i > 0:                # 还有样本没推完
-    return true
-  return false
+    返回:
+      delta_card_ranges[i] = (min_cards, max_cards)
+        - min_cards: 必须调整的卡数（负数表示必须回收，正数表示必须增加）
+        - max_cards: 最多可以调整的卡数（inf表示无上限）
+    """
+    delta_card_ranges = []
 
-函数 TaskCanReleaseInstances():
-  # 当有空闲实例，且剩余样本用不满 K_i^base 时
-  if K_i_idle > 0:
-    # 估计需要多少实例：假设每轮样本均匀分配
-    needed_instances = min(K_i^base, ceil(S_rem_i / S_per_instance))
-    if K_i > needed_instances:
-      return true
-  return false
-```
+    for i in range(n_tasks):
+        task = task_states[i]
+        cards_per_instance = task.tp * task.pp
 
-**重要**：这些信号由任务Agent生成，调度器只负责响应。
+        # 情况1: 有剩余样本，但忙实例数没到基线 → 必须增加
+        if task.K_i^busy < task.K_i^base and task.S_rem_i > 0:
+            min_cards = (task.K_i^base - task.K_i^busy) * cards_per_instance
+            max_cards = float('inf')
+            delta_card_ranges.append( (min_cards, max_cards) )
 
-## 4. 调度决策流程
+        # 情况2: 有空闲实例，且没有剩余样本 → 必须回收
+        elif task.K_i^idle > 0 and task.S_rem_i == 0:
+            min_cards = -task.K_i^idle * cards_per_instance
+            max_cards = 0
+            delta_card_ranges.append( (min_cards, max_cards) )
 
-### 4.1 调度触发事件
+        # 情况3: 忙实例数超过基线 → 可以回收超额部分
+        elif task.K_i^busy > task.K_i^base:
+            min_cards = -(task.K_i^busy - task.K_i^base) * cards_per_instance
+            max_cards = float('inf')
+            delta_card_ranges.append( (min_cards, max_cards) )
 
-以下任一事件触发调度决策：
-1. **实例完成事件**：某个任务的一个推理实例完成了当前batch
-2. **轮次完成事件**：某个任务完成了一整轮（推理+训练）
-3. **任务加入事件**：新任务提交到集群
-4. **任务退出事件**：某个任务完成退出
-5. **任务状态上报**：任务上报 `needs_more_instances` 或 `can_release_instances`
-
-### 4.2 调度决策算法
-
-**核心问题**：没有 `EstimateFutureRoundTime()`，如何评估给任务分配实例的收益？
-
-**答案**：用**当前可观测状态**作为收益代理信号。
-
-**收益信号优先级**（从高到低）：
-1. **P0**: 满足 `needs_more_instances = true` 的任务（必须给它们 `K_i^base`）
-2. **P1**: 在推理阶段、`K_i < K_i^base`、有剩余样本的任务（次优先）
-3. **P2**: 在推理阶段、`K_i >= K_i^base`、但剩余样本还很多的任务（最后考虑）
-4. **无收益**: 在训练阶段的任务（给更多实例也没用）
-
-**长尾处理**：
-- 不给长尾任务增加实例（因为本轮样本已分配完，加实例也没用）
-- 长尾只是一个**观测信号**，用于理解发生了什么，但不用于分配决策
-
-```
-函数 Schedule():
-  """
-  调度决策主函数
-  1. 先收集所有需求
-  2. 模拟分配/回收，检查避免回收后马上归还
-  3. 最终一起发起命令
-  """
-
-  # ========== 阶段1: 收集所有可靠信号 ==========
-  P0_tasks = []           # 需要恢复到 K_i^base 的任务（必须满足）
-  AllCandidates = []      # 所有可以分配的任务（P1+P2合并）
-  Reclaimable = []        # 可以回收的任务（有空闲实例）
-
-  for each task i:
-    # ---------- P0: 任务明确说需要更多实例 ----------
-    if i.needs_more_instances and K_i < K_i^base:
-      deficit = K_i^base - K_i
-      P0_tasks.append( (i, deficit) )
-
-    # ---------- 收集所有分配候选 ----------
-    score = ComputeAllocationScore(i)
-    if score > 0:
-      AllCandidates.append( (-score, i) )  # 负号用于降序排序
-
-    # ---------- 可以回收的任务（只回收空闲实例） ----------
-    if K_i_idle > 0:
-      # 优先回收有空闲实例的任务
-      reclaim_priority = K_i_idle
-      Reclaimable.append( (-reclaim_priority, i) )
-
-  # 按优先级排序
-  Reclaimable.sort()     # 空闲多的在前
-  AllCandidates.sort()    # 分数高的在前
-
-  # ========== 阶段2: 模拟分配，避免回收后马上归还 ==========
-  # 用临时状态模拟，不真正执行
-  temp_state = CopyCurrentState()
-  pending_reclaims = []   # 待回收列表
-  pending_allocations = [] # 待分配列表
-
-  # ---------- 先处理 P0 任务（必须满足） ----------
-  for (i, deficit) in P0_tasks:
-    while deficit > 0:
-      cards_needed = cards_per_instance_i
-
-      # 先看有没有空闲GPU
-      if temp_state.C_free >= cards_needed:
-        placement = FindBestPlacement(i, temp_state.free_gpus)
-        if placement is not None:
-          pending_allocations.append( (i, 1, placement) )
-          temp_state.Allocate(i, 1, placement)
-          deficit -= 1
+        # 情况4: 其他 → 不强制调整
         else:
-          break
-      else:
-        # 需要从其他任务回收（只回收有空闲实例的任务）
-        if not Reclaimable:
-          break
+            min_cards = 0
+            max_cards = float('inf')
+            delta_card_ranges.append( (min_cards, max_cards) )
 
-        (neg_prio, j) = Reclaimable.pop(0)
-
-        # 关键检查：不要从 P0 任务回收！
-        if j in [t for (t, d) in P0_tasks]:
-          continue
-
-        # 模拟回收j的空闲实例
-        reclaim_count = min(j.K_i_idle, 1)
-        if reclaim_count > 0:
-          pending_reclaims.append( (j, reclaim_count) )
-          temp_state.Reclaim(j, reclaim_count)
-
-  # ---------- 再处理其他任务（把所有空闲GPU都分配完） ----------
-  # 合并剩余的候选，继续分配直到没有空闲GPU
-  while temp_state.C_free > 0 and AllCandidates:
-    (neg_score, i) = AllCandidates.pop(0)
-
-    # 检查上限
-    max_allowed = 1.5 * K_i^base
-    if temp_state.GetK(i) >= max_allowed:
-      continue
-
-    cards_needed = cards_per_instance_i
-    if temp_state.C_free >= cards_needed:
-      placement = FindBestPlacement(i, temp_state.free_gpus)
-      if placement is not None:
-        pending_allocations.append( (i, 1, placement) )
-        temp_state.Allocate(i, 1, placement)
-        # 重新计算分数，如果还有收益继续排队
-        new_score = ComputeAllocationScoreWithState(i, temp_state)
-        if new_score > 0 and temp_state.GetK(i) < max_allowed:
-          insert (-new_score, i) into AllCandidates in sorted order
-
-  # ========== 阶段3: 最终一起发起命令 ==========
-  # 先回收，再分配
-  for (j, count) in pending_reclaims:
-    Reclaim(j, count)
-
-  for (i, count, placement) in pending_allocations:
-    Allocate(i, count, placement)
+    return delta_card_ranges
 ```
 
-**设计说明**：
-1. **不主动回收非空闲实例**：只回收 `K_i_idle > 0` 的任务
-2. **模拟分配避免抖动**：先用临时状态模拟，检查避免从P0任务回收
-3. **批量执行命令**：决策完成后，先回收再分配，一起发起命令
-4. **空闲卡全部分配完**：一直分配直到 `C_free == 0`
+---
 
-### 4.3 收益评分函数
+## 4. 阶段二：dont_starve() - 优先满足"没小康"的任务
 
-**关键思想**：不预测未来，只用**当前可观测状态**来评分。
+优先满足所有 `min > 0` 的任务（也就是"没小康"的任务：有剩余样本但忙实例数没到基线）。
 
-```
-函数 ComputeAllocationScore(task_i):
-  """
-  计算给 task_i 分配一个实例的收益分数（0-100）
-  分数越高越值得分配
-  """
+**回收优先级**：
+1. 优先从本就空闲的卡中选
+2. 如果没有空闲卡，先从"富得流油"的任务回收（`K_i^idle > 0`）
+3. 再从"遥遥领先"的任务回收（`K_i^busy > K_i^base`）
 
-  # 情况1: 在训练阶段，给实例没用
-  if not task_i.in_rollout_phase:
-    return 0
+```python
+def dont_starve(delta_card_ranges):
+    """
+    优先满足min > 0的任务，生成初步plan
 
-  # 情况2: 没有剩余样本了
-  if task_i.S_rem_i <= 0:
-    return 0
+    返回:
+      plan: 每个任务的卡数调整量（正数=增加，负数=回收）
+      excess_cards: 富余的卡数（可以继续分配）
+    """
+    plan = [0] * n_tasks
+    free_cards = get_current_free_cards()
 
-  score = 0
+    # ---------- 第一步: 收集需求 ----------
+    needy_tasks = []  # 需要增加卡的任务 (min > 0)
+    reclaimable_tasks = []  # 可以回收卡的任务
 
-  # ---------- 信号1: 当前实例数 vs 基准 ----------
-  if K_i < K_i^base:
-    # 还没到基准，分数很高
-    deficit_ratio = (K_i^base - K_i) / K_i^base
-    score += 50 * deficit_ratio  # 最多+50分
+    for i in range(n_tasks):
+        min_cards, max_cards = delta_card_ranges[i]
 
-  # ---------- 信号2: 忙实例比例 ----------
-  if K_i > 0:
-    busy_ratio = K_i_busy / K_i
-    score += 30 * busy_ratio  # 都在忙的话+30分
+        if min_cards > 0:
+            needy_tasks.append( (i, min_cards) )
+        elif min_cards < 0:
+            # 可以回收，按优先级排序
+            task = task_states[i]
+            if task.K_i^idle > 0:
+                priority = 0  # 最高优先级：有空闲实例
+            else:
+                priority = 1  # 次优先级：忙实例超基线
+            reclaimable_tasks.append( (priority, i, -min_cards) )
 
-  # ---------- 信号3: 剩余样本充足度 ----------
-  # 假设每个实例每轮能处理 S_per_instance 个样本
-  # 剩余样本够不够当前实例吃好几轮？
-  if K_i > 0:
-    samples_per_instance_per_round = S_per_round_i / K_i
-    if samples_per_instance_per_round > 0:
-      rounds_left_at_current = task_i.S_rem_i / samples_per_instance_per_round / K_i
-      # 剩余样本够吃越久，越值得给更多实例
-      sample_sufficiency = min(rounds_left_at_current / 5, 1.0)  # 够吃5轮就满分
-      score += 20 * sample_sufficiency  # 最多+20分
+    # 按优先级排序可回收任务
+    reclaimable_tasks.sort()
 
-  return score
-```
+    # ---------- 第二步: 满足 needy_tasks ----------
+    for (i, needed_cards) in needy_tasks:
+        while needed_cards > 0:
+            cards_per_instance = task_states[i].tp * task_states[i].pp
 
-**设计理由**：
-- 不需要预测未来
-- 所有信号都是当前可观测的
-- 分数是启发式的，但方向正确
-- 优先帮助那些在推理阶段、缺实例、所有实例都在忙、剩余样本还很多的任务
+            # 先看有没有足够的空闲卡
+            if free_cards >= cards_per_instance:
+                # 找拓扑最佳的放置
+                placement = find_best_placement(task_states[i], free_gpus)
+                if placement:
+                    plan[i] += cards_per_instance
+                    free_cards -= cards_per_instance
+                    needed_cards -= cards_per_instance
+                else:
+                    break
+            else:
+                # 需要回收
+                if not reclaimable_tasks:
+                    break
 
-### 4.4 拓扑感知的放置算法
+                priority, j, reclaimable_cards = reclaimable_tasks.pop(0)
+                cards_per_instance_j = task_states[j].tp * task_states[j].pp
 
-**FindBestPlacement(task_i, free_gpus)**: 为任务i找到最佳GPU放置
+                # 回收一个实例
+                reclaim_amount = min(reclaimable_cards, cards_per_instance_j)
+                plan[j] -= reclaim_amount
+                free_cards += reclaim_amount
 
-```
-函数 FindBestPlacement(task_i, free_gpus):
-  # 需要 tp_i 张GPU组成一个实例
-  required = task_i.tp_i
+                # 如果还能回收，放回去
+                remaining = reclaimable_cards - reclaim_amount
+                if remaining > 0:
+                    reclaimable_tasks.append( (priority, j, remaining) )
+                    reclaimable_tasks.sort()
 
-  # 按机器分组空闲GPU
-  free_by_machine = GroupByMachine(free_gpus)
+    # ---------- 第三步: 计算富余卡 ----------
+    # 额外回收一些可以回收的，作为富余卡
+    excess_cards = free_cards
 
-  best_placement = None
-  best_score = -infinity
-
-  # 策略1: 优先找同一台机器上有足够GPU的
-  for machine m in free_by_machine:
-    if len(free_by_machine[m]) >= required:
-      # 同一机器有足够GPU，完美放置
-      placement = PickGPUsFromMachine(m, required)
-      score = ColocalityScore(placement)  # 满分
-      return placement
-
-  # 策略2: 找跨机器但机器数最少的
-  for candidate_placement in GenerateCandidatePlacements(free_gpus, required):
-    score = ColocalityScore(candidate_placement)
-    if score > best_score:
-      best_score = score
-      best_placement = candidate_placement
-
-  return best_placement
-
-函数 ColocalityScore(placement):
-  # 计算放置的拓扑分数
-  # 同一机器的GPU越多分数越高
-  machine_counts = CountMachines(placement)
-  max_in_one_machine = max(machine_counts.values())
-  return max_in_one_machine / len(placement)  # 0-1之间，越高越好
+    return plan, excess_cards
 ```
 
-### 4.5 回收决策下放
+---
 
-当调度器决定从任务j回收1个实例时：
+## 5. 阶段三：feed_more() - 富余卡喂给收益最大的任务
 
-1. 调度器只发送：`请回收1个实例`
-2. 任务Agent自己决定回收哪1个实例：
-   - 优先回收空闲实例
-   - 如果没有空闲实例，优先回收最慢的实例
-   - 确保剩下的实例有良好的拓扑放置
+如果 `excess_cards` 不为空，则选择收益最大的任务分发，分发数量可以按剩余样本量估计。
 
-**调度器不关心具体回收哪几张卡，只关心数量。**
+```python
+def feed_more(delta_card_ranges, plan, excess_cards):
+    """
+    把富余卡分配给收益最大的任务
+    """
+    # 计算每个任务的收益分
+    task_scores = []
+    for i in range(n_tasks):
+        min_cards, max_cards = delta_card_ranges[i]
+        task = task_states[i]
 
-### 4.6 长尾检测
+        # 跳过已经满足min的任务，或者不能再增加的任务
+        if max_cards <= 0:
+            continue
 
-**HasLongTail(i)**: 判断任务i是否正在经历长尾
+        # 计算收益分
+        score = compute_allocation_score(task)
+        if score > 0:
+            task_scores.append( (-score, i) )  # 负号用于降序
 
-```
-函数 HasLongTail(i):
-  """
-  长尾的正确定义：
-  不是"实例间样本数差异大"（因为每个样本推理时间本来就不同）
-  而是"部分实例已经没有样本可取了，而其他实例还在执行推理"
-  """
-  if not InRolloutPhase(i):
-    return False
+    # 按分数排序
+    task_scores.sort()
 
-  # 检查是否有实例已经空闲（没样本可取了），同时还有实例在忙
-  has_idle_instances = (K_i_idle > 0)
-  has_busy_instances = (K_i_busy > 0)
+    # 分配富余卡
+    while excess_cards > 0 and task_scores:
+        neg_score, i = task_scores.pop(0)
+        task = task_states[i]
+        cards_per_instance = task.tp * task.pp
 
-  # 部分实例闲了、部分还在忙 → 长尾
-  return has_idle_instances and has_busy_instances
-```
+        # 检查上限
+        current_cards = task.K_i * cards_per_instance + plan[i]
+        max_allowed = 1.5 * task.K_i^base * cards_per_instance
+        if current_cards >= max_allowed:
+            continue
 
-**注意**：检测到长尾只是用于观测，**不用于**分配决策（因为给长尾任务加实例没用，本轮样本已分配完）。
+        if excess_cards >= cards_per_instance:
+            placement = find_best_placement(task, free_gpus)
+            if placement:
+                plan[i] += cards_per_instance
+                excess_cards -= cards_per_instance
 
-## 5. 系统架构与接口
+                # 如果还有收益，继续排队
+                new_score = compute_allocation_score_with_plan(task, plan[i])
+                if new_score > 0:
+                    new_current = current_cards + cards_per_instance
+                    if new_current < max_allowed:
+                        task_scores.append( (-new_score, i) )
+                        task_scores.sort()
 
-### 5.1 系统架构
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                           全局调度器                                       │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐ │
-│  │  状态管理器      │  │  调度决策引擎    │  │  收益评分器          │ │
-│  │  - 任务状态      │  │  - P0任务处理     │  │  - Compute-         │ │
-│  │  - GPU池状态     │  │  - P1/P2任务分配  │  │    AllocationScore()│ │
-│  │  - 机器拓扑      │  │  - 回收决策       │  │                      │ │
-│  └──────────────────┘  └──────────────────┘  └──────────────────────┘ │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    拓扑放置管理器                                  │   │
-│  │  - FindBestPlacement()                                          │   │
-│  │  - ColocalityScore()                                            │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-└────────┬─────────────────────────────────────────────────────────────────┘
-         │
-         │  RPC / gRPC
-         │
-┌────────▼──────────┐  ┌────────▼──────────┐  ┌────────▼──────────┐
-│  任务Agent A      │  │  任务Agent B      │  │  任务Agent C      │
-│  ┌─────────────┐  │  │  ┌─────────────┐  │  │  ┌─────────────┐  │
-│  │  信号生成器 │  │  │  │  信号生成器 │  │  │  │  信号生成器 │  │
-│  │  - needs-   │  │  │  │  - needs-   │  │  │  │  - needs-   │  │
-│  │    more-    │  │  │  │    more-    │  │  │  │    more-    │  │
-│  │    instances│  │  │  │    instances│  │  │  │    instances│  │
-│  │  - can-     │  │  │  │  - can-     │  │  │  │  - can-     │  │
-│  │    release-  │  │  │  │    release-  │  │  │  │    release-  │  │
-│  │    instances│  │  │  │    instances│  │  │  │    instances│  │
-│  │  - 长尾检测 │  │  │  │  - 长尾检测 │  │  │  │  - 长尾检测 │  │
-│  └─────────────┘  │  │  └─────────────┘  │  │  └─────────────┘  │
-│  ┌─────────────┐  │  │  ┌─────────────┐  │  │  ┌─────────────┐  │
-│  │ GPU管理器   │  │  │  │ GPU管理器   │  │  │  │ GPU管理器   │  │
-│  │ - 权重加载  │  │  │  │ - 权重加载  │  │  │  │ - 权重加载  │  │
-│  │ - 实例启停  │  │  │  │ - 实例启停  │  │  │  │ - 实例启停  │  │
-│  │ - 回收决策  │  │  │  │ - 回收决策  │  │  │  │ - 回收决策  │  │
-│  └─────────────┘  │  │  └─────────────┘  │  │  └─────────────┘  │
-└────────────────────┘  └────────────────────┘  └────────────────────┘
+    return plan
 ```
 
-### 5.2 Protobuf 接口定义
+### 5.1 收益评分函数
+
+```python
+def compute_allocation_score(task):
+    """
+    计算给任务分配一个实例的收益分数（0-100）
+    """
+    # 在训练阶段，给实例没用
+    if not task.in_rollout_phase:
+        return 0
+
+    # 没有剩余样本了
+    if task.S_rem_i <= 0:
+        return 0
+
+    score = 0
+
+    # 信号1: 当前实例数 vs 基准
+    if task.K_i < task.K_i^base:
+        deficit_ratio = (task.K_i^base - task.K_i) / task.K_i^base
+        score += 50 * deficit_ratio
+
+    # 信号2: 忙实例比例
+    if task.K_i > 0:
+        busy_ratio = task.K_i^busy / task.K_i
+        score += 30 * busy_ratio
+
+    # 信号3: 剩余样本充足度
+    if task.K_i > 0:
+        samples_per_instance_per_round = task.S_per_round_i / task.K_i
+        if samples_per_instance_per_round > 0:
+            rounds_left = task.S_rem_i / samples_per_instance_per_round / task.K_i
+            sample_sufficiency = min(rounds_left / 5, 1.0)
+            score += 20 * sample_sufficiency
+
+    return score
+```
+
+---
+
+## 6. 阶段四：execute() - 执行plan
+
+决策完成后，一起发起命令。先回收，再分配。
+
+```python
+def execute(plan):
+    """
+    执行调度plan
+
+    plan[i]: 任务i的卡数调整量
+      - 正数: 分配这么多卡
+      - 负数: 回收这么多卡
+      - 0: 不调整
+    """
+    # 先执行回收
+    for i in range(n_tasks):
+        if plan[i] < 0:
+            cards_to_reclaim = -plan[i]
+            instances_to_reclaim = cards_to_reclaim // (task_states[i].tp * task_states[i].pp)
+            reclaim(task_states[i], instances_to_reclaim)
+
+    # 再执行分配
+    for i in range(n_tasks):
+        if plan[i] > 0:
+            cards_to_allocate = plan[i]
+            instances_to_allocate = cards_to_allocate // (task_states[i].tp * task_states[i].pp)
+            for _ in range(instances_to_allocate):
+                placement = find_best_placement(task_states[i], free_gpus)
+                if placement:
+                    allocate(task_states[i], 1, placement)
+```
+
+---
+
+## 7. 拓扑感知放置
+
+```python
+def find_best_placement(task, free_gpus):
+    """
+    为任务找到最佳GPU放置
+    优先同一机器 → 最少跨机器 → 任意放置
+    """
+    required = task.tp
+    free_by_machine = group_by_machine(free_gpus)
+
+    # 策略1: 优先找同一台机器上有足够GPU的
+    for machine in free_by_machine:
+        if len(free_by_machine[machine]) >= required:
+            return pick_gpus_from_machine(machine, required)
+
+    # 策略2: 找跨机器但机器数最少的
+    best_placement = None
+    best_score = -float('inf')
+
+    for candidate in generate_candidate_placements(free_gpus, required):
+        score = colocality_score(candidate)
+        if score > best_score:
+            best_score = score
+            best_placement = candidate
+
+    return best_placement
+
+def colocality_score(placement):
+    """计算放置的拓扑分数（同一机器的GPU越多分数越高）"""
+    machine_counts = count_machines(placement)
+    max_in_one_machine = max(machine_counts.values())
+    return max_in_one_machine / len(placement)
+```
+
+---
+
+## 8. 系统架构与接口
+
+### 8.1 Protobuf 接口定义
 
 ```protobuf
 // GPU位置信息
@@ -424,36 +380,20 @@ message GPUPlacement {
 message InstanceState {
   int32 instance_id = 1;
   bool is_busy = 2;
-
-  // 推理阶段的实时指标
-  double elapsed_time_sec = 3;    // τ_elapsed_j
-  int32 done_samples = 4;          // S_done_j
-  int32 remaining_samples = 5;     // S_rem_j
-
-  // GPU放置信息
-  repeated GPUPlacement gpus = 6;   // 这个实例占用的GPU
+  double elapsed_time_sec = 3;
+  int32 done_samples = 4;
+  int32 remaining_samples = 5;
+  repeated GPUPlacement gpus = 6;
 }
 
 // 任务配置
 message TaskConfig {
   string task_id = 1;
-  int32 base_instances = 2;      // K_i^base
-  int32 tp = 3;                    // 2的幂
-  int32 pp = 4;                    // 2的幂
-  int32 samples_per_round = 5;   // S_per_round_i
-  int32 total_samples = 6;        // S_total_i
-}
-
-// 各阶段耗时指标（可选，仅用于观测）
-message PhaseMetrics {
-  double weight_transfer_sec = 1;
-  double rollout_gen_sec = 2;
-  double rollout_tool_sec = 3;
-  double ref_log_prob_sec = 4;
-  double reward_sec = 5;
-  double adv_sec = 6;
-  double update_sec = 7;
-  double total_round_sec = 8;
+  int32 base_instances = 2;
+  int32 tp = 3;
+  int32 pp = 4;
+  int32 samples_per_round = 5;
+  int32 total_samples = 6;
 }
 
 // 任务状态上报
@@ -464,40 +404,30 @@ message TaskStateReport {
   int32 done_samples = 2;
   int32 done_rounds = 3;
   double elapsed_time_sec = 4;
+  int32 remaining_samples = 5;
 
   // 当前分配
-  int32 current_instances = 5;
-  int32 idle_instances = 6;
+  int32 current_instances = 6;
+  int32 idle_instances = 7;
+  int32 busy_instances = 8;
 
-  // ========== 核心调度信号 ==========
-  bool needs_more_instances = 7;   // 需要增加实例到 K_i^base
-  bool can_release_instances = 8;   // 有空闲实例可以释放
-  bool in_rollout_phase = 9;        // 是否处于推理阶段
-  int32 remaining_samples = 10;      // S_rem_i
+  // 阶段
+  bool in_rollout_phase = 9;
 
   // 各实例状态
-  repeated InstanceState instances = 11;
-
-  // 本轮最新的阶段耗时（可选，用于观测）
-  PhaseMetrics latest_metrics = 12;
+  repeated InstanceState instances = 10;
 }
 
 // 调度决策：为单个任务的分配
 message TaskAllocation {
   string task_id = 1;
-
-  // 目标实例数（调度器只决定数量）
-  int32 target_instances = 2;
-
-  // 推荐的GPU放置（任务可以选择不遵守）
+  int32 instance_delta = 2;  // 正数=增加，负数=回收，0=不变
   repeated GPUPlacement recommended_gpus = 3;
 }
 
 // 调度决策
 message SchedulingDecision {
   repeated TaskAllocation allocations = 1;
-
-  // 决策时间戳
   double timestamp_sec = 2;
 }
 
@@ -505,62 +435,59 @@ message SchedulingDecision {
 message ReclaimConfirm {
   string task_id = 1;
   int32 reclaimed_instances = 2;
-  repeated GPUPlacement reclaimed_gpus = 3;  // 具体回收了哪些GPU
+  repeated GPUPlacement reclaimed_gpus = 3;
 }
 
 // 调度器服务
 service GlobalScheduler {
-  // 任务注册
   rpc RegisterTask(TaskConfig) returns (RegisterResponse);
-
-  // 任务状态上报（触发调度）
   rpc ReportState(TaskStateReport) returns (SchedulingDecision);
-
-  // 任务退出
   rpc UnregisterTask(UnregisterRequest) returns (Empty);
 }
 ```
 
-## 6. 调优参数
+---
+
+## 9. 调优参数
 
 | 参数名 | 推荐初始值 | 说明 |
 |--------|-----------|------|
-| `max_extra_instances_ratio` | 1.5 | 最多给任务额外分配多少倍 `K_i^base`（P2阶段） |
+| `max_extra_instances_ratio` | 1.5 | 最多给任务额外分配多少倍 `K_i^base` |
 
-## 7. 边界情况处理
+---
+
+## 10. 边界情况处理
 
 **新任务加入**：
 - 初始分配给它 `K_i^base` 个实例（如果有足够GPU）
-- 如果GPU不够，先给 `K_i^min` 个实例，有空闲时再补上
+- 如果GPU不够，先给1个实例，有空闲时再补上
 
 **任务退出**：
 - 回收该任务的所有GPU
-- 重新触发一次调度，把GPU分配给其他任务
+- 重新触发一次调度
 
-**某个任务严重落后**：
-- 任务自己会检测到并上报 `needs_more_instances = true`
-- 调度器优先满足这类任务，恢复到 `K_i^base`
-
-**GPU不足以满足所有 `needs_more_instances`**：
+**GPU不足以满足所有 needy_tasks**：
 - 按任务提交顺序或者优先级分配
-- 或者临时启用"抢占模式"：从 `can_release_instances` 的任务回收
 
-## 8. 可观测性
+---
+
+## 11. 可观测性
 
 **调度器级别监控**：
 - 调度决策频率
 - GPU利用率（总、平均）
 - 各任务的GPU分配变化历史
 - 切换次数/频率
-- P0/P1任务队列长度
+- needy_tasks队列长度
 
 **任务级别监控**：
-- 每个任务的 `needs_more_instances` 事件计数
-- 每个任务的 `can_release_instances` 事件计数
-- 每个任务的长尾因子时间序列
-- 每个任务的 `K_i(t)` vs `K_i^base`
+- 每个任务的 `K_i^busy` vs `K_i^base`
+- 每个任务的 `K_i^idle` 时间序列
+- 每个任务的长尾检测状态
 
-## 9. 降级模式
+---
+
+## 12. 降级模式
 
 如果调度器出现问题，可以降级到：
 1. **固定分配模式**：所有任务保持 `K_i^base` 不变
