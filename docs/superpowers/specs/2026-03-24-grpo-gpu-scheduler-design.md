@@ -84,9 +84,15 @@ def assess_range(task_states):
         task = task_states[i]
         cards_per_instance = task.tp * task.pp
 
+        # 情况0: 不在rollout阶段 → 所有空闲实例都可以回收，且不再分配
+        if not task.in_rollout_phase:
+            min_cards = -task.K_i^idle * cards_per_instance
+            max_cards = 0
+            delta_card_ranges.append( (min_cards, max_cards) )
+
         # 情况1: 有剩余样本，但忙实例数没到基线 → 必须增加
-        if task.K_i^busy < task.K_i^base and task.S_rem_i > 0:
-            min_cards = (task.K_i^base - task.K_i^busy) * cards_per_instance
+        elif task.K_i^busy < task.K_i^base and task.S_rem_i > 0:
+            min_cards = (max_extra_instances_ratio * task.K_i^base - task.K_i^busy) * cards_per_instance
             max_cards = float('inf')
             delta_card_ranges.append( (min_cards, max_cards) )
 
@@ -452,7 +458,7 @@ service GlobalScheduler {
 
 | 参数名 | 推荐初始值 | 说明 |
 |--------|-----------|------|
-| `max_extra_instances_ratio` | 1.5 | 最多给任务额外分配多少倍 `K_i^base` |
+| `max_extra_instances_ratio` | 1.2 | 最多给任务额外分配多少倍 `K_i^base`（可以给饥饿状态的任务多一些实例） |
 
 ---
 
