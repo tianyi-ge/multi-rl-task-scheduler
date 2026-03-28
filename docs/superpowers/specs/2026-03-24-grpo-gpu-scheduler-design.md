@@ -45,6 +45,10 @@ if excess_cards:
 execute(plan)
 ```
 
+**关键点**：
+- `assess_range`、`dont_starve`、`feed_more` 只计算**卡数调整量**，不涉及具体GPU放置
+- `execute` 阶段才处理具体GPU分配，使用调度器维护的 `free_gpus` 表
+
 ### 2.1 符号定义
 
 **任务级指标**：
@@ -58,9 +62,9 @@ execute(plan)
 - `cards_per_instance_i = tp_i * pp_i`：每个实例需要的卡数
 - `S_rem_i`：剩余样本数
 
-**集群拓扑**：
-- `M_m`：第m台机器
-- `G_{m,g}`：机器m上的第g张GPU
+**集群状态**：
+- `free_gpus`：调度器维护的空闲GPU表，包含具体哪台机器的哪几张卡
+  - 格式：`[(machine_id, gpu_id), ...]`
 
 ---
 
@@ -92,7 +96,7 @@ def assess_range(task_states):
 
         # 情况1: 有剩余样本，但忙实例数没到基线 → 必须增加
         elif task.K_i^busy < task.K_i^base and task.S_rem_i > 0:
-            min_cards = (max_extra_instances_ratio * task.K_i^base - task.K_i^busy) * cards_per_instance
+            min_cards = (catch_up_ratio * task.K_i^base - task.K_i^busy) * cards_per_instance
             max_cards = float('inf')
             delta_card_ranges.append( (min_cards, max_cards) )
 
@@ -128,6 +132,8 @@ def assess_range(task_states):
 2. 如果没有空闲卡，先从"富得流油"的任务回收（`K_i^idle > 0`）
 3. 再从"遥遥领先"的任务回收（`K_i^busy > K_i^base`）
 
+**注意**：这一阶段只计算卡数，不做具体GPU放置。
+
 ```python
 def dont_starve(delta_card_ranges):
     """
@@ -138,7 +144,7 @@ def dont_starve(delta_card_ranges):
       excess_cards: 富余的卡数（可以继续分配）
     """
     plan = [0] * n_tasks
-    free_cards = get_current_free_cards()
+    free_card_count = get_current_free_card_count()  # 只统计数量，不关心具体GPU
 
     # ---------- 第一步: 收集需求 ----------
     needy_tasks = []  # 需要增加卡的任务 (min > 0)
@@ -167,15 +173,10 @@ def dont_starve(delta_card_ranges):
             cards_per_instance = task_states[i].tp * task_states[i].pp
 
             # 先看有没有足够的空闲卡
-            if free_cards >= cards_per_instance:
-                # 找拓扑最佳的放置
-                placement = find_best_placement(task_states[i], free_gpus)
-                if placement:
-                    plan[i] += cards_per_instance
-                    free_cards -= cards_per_instance
-                    needed_cards -= cards_per_instance
-                else:
-                    break
+            if free_card_count >= cards_per_instance:
+                plan[i] += cards_per_instance
+                free_card_count -= cards_per_instance
+                needed_cards -= cards_per_instance
             else:
                 # 需要回收
                 if not reclaimable_tasks:
@@ -187,7 +188,7 @@ def dont_starve(delta_card_ranges):
                 # 回收一个实例
                 reclaim_amount = min(reclaimable_cards, cards_per_instance_j)
                 plan[j] -= reclaim_amount
-                free_cards += reclaim_amount
+                free_card_count += reclaim_amount
 
                 # 如果还能回收，放回去
                 remaining = reclaimable_cards - reclaim_amount
@@ -196,8 +197,7 @@ def dont_starve(delta_card_ranges):
                     reclaimable_tasks.sort()
 
     # ---------- 第三步: 计算富余卡 ----------
-    # 额外回收一些可以回收的，作为富余卡
-    excess_cards = free_cards
+    excess_cards = free_card_count
 
     return plan, excess_cards
 ```
@@ -207,6 +207,8 @@ def dont_starve(delta_card_ranges):
 ## 5. 阶段三：feed_more() - 富余卡喂给收益最大的任务
 
 如果 `excess_cards` 不为空，则选择收益最大的任务分发，分发数量可以按剩余样本量估计。
+
+**注意**：这一阶段同样只计算卡数，不做具体GPU放置。
 
 ```python
 def feed_more(delta_card_ranges, plan, excess_cards):
@@ -239,23 +241,21 @@ def feed_more(delta_card_ranges, plan, excess_cards):
 
         # 检查上限
         current_cards = task.K_i * cards_per_instance + plan[i]
-        max_allowed = 1.5 * task.K_i^base * cards_per_instance
+        max_allowed = acceleration_limit_ratio * task.K_i^base * cards_per_instance
         if current_cards >= max_allowed:
             continue
 
         if excess_cards >= cards_per_instance:
-            placement = find_best_placement(task, free_gpus)
-            if placement:
-                plan[i] += cards_per_instance
-                excess_cards -= cards_per_instance
+            plan[i] += cards_per_instance
+            excess_cards -= cards_per_instance
 
-                # 如果还有收益，继续排队
-                new_score = compute_allocation_score_with_plan(task, plan[i])
-                if new_score > 0:
-                    new_current = current_cards + cards_per_instance
-                    if new_current < max_allowed:
-                        task_scores.append( (-new_score, i) )
-                        task_scores.sort()
+            # 如果还有收益，继续排队
+            new_score = compute_allocation_score_with_plan(task, plan[i])
+            if new_score > 0:
+                new_current = current_cards + cards_per_instance
+                if new_current < acceleration_limit_ratio * task.K_i^base * cards_per_instance:
+                    task_scores.append( (-new_score, i) )
+                    task_scores.sort()
 
     return plan
 ```
@@ -304,6 +304,8 @@ def compute_allocation_score(task):
 
 决策完成后，一起发起命令。先回收，再分配。
 
+**关键点**：这一阶段才处理具体GPU放置，使用调度器维护的 `free_gpus` 表。
+
 ```python
 def execute(plan):
     """
@@ -313,42 +315,67 @@ def execute(plan):
       - 正数: 分配这么多卡
       - 负数: 回收这么多卡
       - 0: 不调整
+
+    调度器维护 free_gpus 表：[(machine_id, gpu_id), ...]
     """
-    # 先执行回收
+    # ---------- 第一步: 先执行回收 ----------
     for i in range(n_tasks):
         if plan[i] < 0:
             cards_to_reclaim = -plan[i]
             instances_to_reclaim = cards_to_reclaim // (task_states[i].tp * task_states[i].pp)
-            reclaim(task_states[i], instances_to_reclaim)
 
-    # 再执行分配
+            # 让任务自己决定回收哪些GPU
+            reclaimed_gpus = reclaim(task_states[i], instances_to_reclaim)
+
+            # 更新 free_gpus 表
+            free_gpus.extend(reclaimed_gpus)
+
+    # ---------- 第二步: 再执行分配 ----------
     for i in range(n_tasks):
         if plan[i] > 0:
             cards_to_allocate = plan[i]
             instances_to_allocate = cards_to_allocate // (task_states[i].tp * task_states[i].pp)
+            task = task_states[i]
+
             for _ in range(instances_to_allocate):
-                placement = find_best_placement(task_states[i], free_gpus)
+                # 使用 free_gpus 表找拓扑最佳的放置
+                placement = find_best_placement(task, free_gpus)
                 if placement:
-                    allocate(task_states[i], 1, placement)
+                    allocate(task, 1, placement)
+
+                    # 从 free_gpus 表中移除已分配的GPU
+                    for (machine_id, gpu_id) in placement:
+                        free_gpus.remove( (machine_id, gpu_id) )
 ```
 
 ---
 
 ## 7. 拓扑感知放置
 
+调度器维护 `free_gpus` 表，记录哪些GPU是空闲的，具体到哪台机器的哪几张卡。
+
 ```python
 def find_best_placement(task, free_gpus):
     """
     为任务找到最佳GPU放置
     优先同一机器 → 最少跨机器 → 任意放置
+
+    free_gpus: [(machine_id, gpu_id), ...]
     """
     required = task.tp
-    free_by_machine = group_by_machine(free_gpus)
+
+    # 按机器分组空闲GPU
+    free_by_machine = {}
+    for (machine_id, gpu_id) in free_gpus:
+        if machine_id not in free_by_machine:
+            free_by_machine[machine_id] = []
+        free_by_machine[machine_id].append(gpu_id)
 
     # 策略1: 优先找同一台机器上有足够GPU的
     for machine in free_by_machine:
         if len(free_by_machine[machine]) >= required:
-            return pick_gpus_from_machine(machine, required)
+            gpu_ids = free_by_machine[machine][:required]
+            return [(machine, gpu_id) for gpu_id in gpu_ids]
 
     # 策略2: 找跨机器但机器数最少的
     best_placement = None
@@ -364,8 +391,11 @@ def find_best_placement(task, free_gpus):
 
 def colocality_score(placement):
     """计算放置的拓扑分数（同一机器的GPU越多分数越高）"""
-    machine_counts = count_machines(placement)
-    max_in_one_machine = max(machine_counts.values())
+    machine_counts = {}
+    for (machine_id, gpu_id) in placement:
+        machine_counts[machine_id] = machine_counts.get(machine_id, 0) + 1
+
+    max_in_one_machine = max(machine_counts.values()) if machine_counts else 0
     return max_in_one_machine / len(placement)
 ```
 
@@ -428,7 +458,7 @@ message TaskStateReport {
 message TaskAllocation {
   string task_id = 1;
   int32 instance_delta = 2;  // 正数=增加，负数=回收，0=不变
-  repeated GPUPlacement recommended_gpus = 3;
+  repeated GPUPlacement recommended_gpus = 3;  // 只有分配时会填，回收时不会填
 }
 
 // 调度决策
@@ -441,7 +471,7 @@ message SchedulingDecision {
 message ReclaimConfirm {
   string task_id = 1;
   int32 reclaimed_instances = 2;
-  repeated GPUPlacement reclaimed_gpus = 3;
+  repeated GPUPlacement reclaimed_gpus = 3;  // 具体回收了哪些GPU
 }
 
 // 调度器服务
@@ -458,7 +488,8 @@ service GlobalScheduler {
 
 | 参数名 | 推荐初始值 | 说明 |
 |--------|-----------|------|
-| `max_extra_instances_ratio` | 1.2 | 最多给任务额外分配多少倍 `K_i^base`（可以给饥饿状态的任务多一些实例） |
+| `catch_up_ratio` | 1.2 | `assess_range` 阶段使用：给落后任务多一些卡让它赶上进度（min_cards 计算） |
+| `acceleration_limit_ratio` | 1.5 | `feed_more` 阶段使用：控制不给某个可加速任务分配太多卡 |
 
 ---
 
@@ -469,7 +500,7 @@ service GlobalScheduler {
 - 如果GPU不够，先给1个实例，有空闲时再补上
 
 **任务退出**：
-- 回收该任务的所有GPU
+- 回收该任务的所有GPU，更新 `free_gpus` 表
 - 重新触发一次调度
 
 **GPU不足以满足所有 needy_tasks**：
@@ -485,6 +516,7 @@ service GlobalScheduler {
 - 各任务的GPU分配变化历史
 - 切换次数/频率
 - needy_tasks队列长度
+- `free_gpus` 表大小和拓扑分布
 
 **任务级别监控**：
 - 每个任务的 `K_i^busy` vs `K_i^base`
