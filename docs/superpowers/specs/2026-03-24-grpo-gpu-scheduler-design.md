@@ -80,7 +80,7 @@ def assess_range(task_states):
     返回:
       delta_card_ranges[i] = (min_cards, max_cards)
         - min_cards: 必须调整的卡数（负数表示必须回收，正数表示必须增加）
-        - max_cards: 最多可以调整的卡数（inf表示无上限）
+        - max_cards: 最多可以调整的卡数
     """
     delta_card_ranges = []
 
@@ -97,7 +97,7 @@ def assess_range(task_states):
         # 情况1: 有剩余样本，但忙实例数没到基线 → 必须增加
         elif task.K_i^busy < task.K_i^base and task.S_rem_i > 0:
             min_cards = (catch_up_ratio * task.K_i^base - task.K_i^busy) * cards_per_instance
-            max_cards = float('inf')
+            max_cards = acceleration_limit_ratio * task.K_i^base
             delta_card_ranges.append( (min_cards, max_cards) )
 
         # 情况2: 有空闲实例，且没有剩余样本 → 必须回收
@@ -109,13 +109,13 @@ def assess_range(task_states):
         # 情况3: 忙实例数超过基线 → 可以回收超额部分
         elif task.K_i^busy > task.K_i^base:
             min_cards = -(task.K_i^busy - task.K_i^base) * cards_per_instance
-            max_cards = float('inf')
+            max_cards = acceleration_limit_ratio * task.K_i^base
             delta_card_ranges.append( (min_cards, max_cards) )
 
         # 情况4: 其他 → 不强制调整
         else:
             min_cards = 0
-            max_cards = float('inf')
+            max_cards = acceleration_limit_ratio * task.K_i^base
             delta_card_ranges.append( (min_cards, max_cards) )
 
     return delta_card_ranges
