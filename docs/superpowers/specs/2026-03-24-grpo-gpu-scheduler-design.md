@@ -82,6 +82,78 @@ GroupScheduler ──Reclaim/Assign──> RlxfScheduler
 - 调度决策由GroupScheduler在适当时机主动推送给任务
 - 所有消息都是异步的，通过Ray Actor handle发送
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GS as GroupScheduler
+    participant R1 as RlxfScheduler 1
+    participant R2 as RlxfScheduler 2
+
+    Note over R1,GS: 初始化阶段
+    R1->>GS: register_task(config)
+    activate GS
+    GS-->>R1: True/False
+    deactivate GS
+    R2->>GS: register_task(config)
+    activate GS
+    GS-->>R2: True/False
+    deactivate GS
+
+    Note over R1,GS: 正常调度流程
+    par R1 上报状态（可能包含主动释放）
+        R1->>GS: report_state(TaskStateReport, [ReclaimConfirm?])
+    and R2 上报状态
+        R2->>GS: report_state(TaskStateReport)
+    end
+
+    alt 上报包含主动释放的 ReclaimConfirm
+        GS->>GS: 将释放的 GPU 加入 free_gpus
+    end
+
+    GS->>GS: 触发调度 trigger_scheduling()
+
+    Note over GS: 四阶段调度决策
+    activate GS
+    GS->>GS: assess_range()
+    GS->>GS: dont_starve()
+    GS->>GS: feed_more()
+    GS->>GS: execute(plan)
+    deactivate GS
+
+    alt plan 包含回收
+        GS->>R1: reclaim(num_instances)
+        activate R1
+        R1-->>GS: ReclaimConfirm(gpus)
+        deactivate R1
+
+        GS->>GS: 更新 free_gpus<br/>处理 pending reports<br/>检查回收限制
+
+        alt 触发新调度
+            GS->>GS: trigger_scheduling()
+        else 强制分配（安全阀触发）
+            GS->>GS: 重新计算分配决策
+            GS->>R2: assign(placements)
+            activate R2
+            R2-->>GS: (ack)
+            deactivate R2
+        end
+    else plan 只有分配
+        GS->>R2: assign(placements)
+        activate R2
+        R2-->>GS: (ack)
+        deactivate R2
+    end
+
+    Note over R1,GS: RlxfScheduler 主动释放 GPU
+    R2->>GS: report_state(..., ReclaimConfirm(gpus))
+    GS->>GS: 将主动释放的 GPU 加入 free_gpus
+    GS->>GS: trigger_scheduling()
+
+    Note over R1,GS: 任务退出
+    R1->>GS: unregister_task()
+    GS->>GS: 回收所有GPU<br/>触发新调度
+```
+
 ---
 
 ## 3. 调度核心流程
@@ -631,20 +703,7 @@ class GPUPlacement:
     machine_id: int
 ```
 
-### 9.2 单个推理实例的完整状态
-
-```python
-@dataclass
-class InstanceState:
-    instance_id: int
-    is_busy: bool
-    elapsed_time_sec: float
-    done_samples: int
-    remaining_samples: int
-    gpus: List[GPUPlacement]
-```
-
-### 9.3 任务配置
+### 9.2 任务配置
 
 ```python
 @dataclass
@@ -657,7 +716,7 @@ class TaskConfig:
     total_samples: int
 ```
 
-### 9.4 任务状态上报
+### 9.3 任务状态上报
 
 ```python
 @dataclass
@@ -678,11 +737,13 @@ class TaskStateReport:
     # 阶段
     in_rollout_phase: bool
 
-    # 各实例状态
-    instances: List[InstanceState]
+    # 主动释放的GPU（可选）
+    # 如果RlxfScheduler主动释放了某些实例（比如进入train阶段不再需要）
+    # 可以在这里附带ReclaimConfirm，调度器会将这些GPU加入free_gpus
+    voluntary_reclaim: Optional[ReclaimConfirm] = None
 ```
 
-### 9.5 调度决策：为单个任务的分配
+### 9.4 调度决策：为单个任务的分配
 
 ```python
 @dataclass
@@ -692,7 +753,7 @@ class TaskAllocation:
     recommended_gpus: List[GPUPlacement]  # 只有分配时会填，回收时不会填
 ```
 
-### 9.6 调度决策
+### 9.5 调度决策
 
 ```python
 @dataclass
@@ -701,7 +762,7 @@ class SchedulingDecision:
     timestamp_sec: float
 ```
 
-### 9.7 任务Agent上报：回收确认
+### 9.6 任务Agent上报：回收确认
 
 ```python
 @dataclass
@@ -711,7 +772,7 @@ class ReclaimConfirm:
     reclaimed_gpus: List[GPUPlacement]  # 具体回收了哪些GPU
 ```
 
-### 9.8 GroupScheduler Actor 接口
+### 9.7 GroupScheduler Actor 接口
 
 ```python
 class GroupScheduler:
@@ -728,6 +789,7 @@ class GroupScheduler:
         """
         任务上报状态（无返回值）
         状态更新会被排队，下次调度时统一处理
+        如果report.voluntary_reclaim不为None，调度器会将主动释放的GPU加入free_gpus
         """
         pass
 
@@ -736,7 +798,7 @@ class GroupScheduler:
         pass
 ```
 
-### 9.9 RlxfScheduler Actor 接口
+### 9.8 RlxfScheduler Actor 接口
 
 ```python
 class RlxfScheduler:
@@ -824,6 +886,10 @@ class RlxfScheduler:
 **GPU不足以满足所有 needy_tasks**：
 - 按任务提交顺序或者优先级分配
 
+**RlxfScheduler 主动释放GPU**：
+- 当任务进入train阶段或不再需要某些实例时，可以在 `report_state` 时通过 `voluntary_reclaim` 字段主动释放GPU
+- 调度器收到后会将这些GPU加入 `free_gpus`，然后触发一次调度
+
 ---
 
 ## 12. 可观测性
@@ -860,6 +926,7 @@ class RlxfScheduler:
 | `task.allocation_changes` | Counter | 分配调整次数 |
 | `task.reclaim_count` | Counter | 被回收次数 |
 | `task.assign_count` | Counter | 被分配次数 |
+| `task.voluntary_reclaim_count` | Counter | 主动释放次数 |
 
 ### 12.3 调度决策日志（每决策一条）
 
@@ -873,7 +940,7 @@ class SchedulingTrace:
     duration_sec: float
 
     # 触发原因
-    trigger_type: str  # "state_report", "task_register", "task_unregister", "manual"
+    trigger_type: str  # "state_report", "task_register", "task_unregister", "voluntary_reclaim", "manual"
 
     # 回收限制状态
     consecutive_reclaim_count_before: int  # 调度前的连续回收次数
@@ -906,10 +973,10 @@ class GPUAllocationEvent:
     event_id: str
     timestamp_sec: float
     task_id: str
-    event_type: str  # "assign", "reclaim"
+    event_type: str  # "assign", "reclaim", "voluntary_reclaim"
     instance_count: int
     gpus: List[GPUPlacement]
-    reason: str  # "dont_starve", "feed_more", "task_exit", etc.
+    reason: str  # "dont_starve", "feed_more", "task_exit", "voluntary", etc.
 ```
 
 ---
