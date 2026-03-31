@@ -141,6 +141,8 @@ def assess_range(task_states):
     for i in range(n_tasks):
         task = task_states[i]
         cards_per_instance = task.tp * task.pp
+        current_cards = task.K_i * cards_per_instance
+        max_total_cards = acceleration_limit_ratio * task.K_i_base * cards_per_instance
 
         # 情况0: 不在rollout阶段（包括刚注册还没开始的任务）→ 所有空闲实例都可以回收，且不再分配
         if not task.in_rollout_phase:
@@ -151,25 +153,28 @@ def assess_range(task_states):
         # 情况1: 有剩余样本，但忙实例数没到基线 → 必须增加
         elif task.K_i_busy < task.K_i_base and task.S_rem_i > 0:
             min_cards = (catch_up_ratio * task.K_i_base - task.K_i_busy) * cards_per_instance
-            max_cards = acceleration_limit_ratio * task.K_i_base
+            max_cards = max_total_cards - current_cards
             delta_card_ranges.append( (min_cards, max_cards) )
 
-        # 情况2: 有空闲实例，且没有剩余样本 → 必须回收
-        elif task.K_i_idle > 0 and task.S_rem_i == 0:
-            min_cards = -task.K_i_idle * cards_per_instance
+        # 情况2: 有空闲实例，且没有剩余样本 → 必须回收（包括空闲实例和超额忙实例）
+        elif task.S_rem_i == 0:
+            must_reclaim_instances = task.K_i_idle
+            if task.K_i_busy > task.K_i_base:
+                must_reclaim_instances += (task.K_i_busy - task.K_i_base)
+            min_cards = -must_reclaim_instances * cards_per_instance
             max_cards = 0
             delta_card_ranges.append( (min_cards, max_cards) )
 
         # 情况3: 忙实例数超过基线 → 可以回收超额部分
         elif task.K_i_busy > task.K_i_base:
             min_cards = -(task.K_i_busy - task.K_i_base) * cards_per_instance
-            max_cards = acceleration_limit_ratio * task.K_i_base
+            max_cards = max_total_cards - current_cards
             delta_card_ranges.append( (min_cards, max_cards) )
 
         # 情况4: 其他 → 不强制调整
         else:
             min_cards = 0
-            max_cards = acceleration_limit_ratio * task.K_i_base
+            max_cards = max_total_cards - current_cards
             delta_card_ranges.append( (min_cards, max_cards) )
 
     return delta_card_ranges
@@ -216,10 +221,11 @@ def dont_starve(delta_card_ranges):
                 priority = 0  # 最高优先级：有空闲实例
             else:
                 priority = 1  # 次优先级：忙实例超基线
-            reclaimable_tasks.append( (priority, i, -min_cards) )
+            reclaimable_cards = -min_cards
+            reclaimable_tasks.append( (priority, reclaimable_cards, i) )
 
-    # 按优先级排序可回收任务
-    reclaimable_tasks.sort()
+    # 按priority降序排序，其次按-reclaimable_cards升序排序（即按reclaimable_cards降序）
+    reclaimable_tasks.sort(key=lambda x: (-x[0], -x[1]))
 
     # ---------- 第二步: 满足 needy_tasks ----------
     for (i, needed_cards) in needy_tasks:
@@ -236,7 +242,7 @@ def dont_starve(delta_card_ranges):
                 if not reclaimable_tasks:
                     break
 
-                priority, j, reclaimable_cards = reclaimable_tasks.pop(0)
+                priority, reclaimable_cards, j = reclaimable_tasks.pop()
                 cards_per_instance_j = task_states[j].tp * task_states[j].pp
 
                 # 回收一个实例
@@ -244,11 +250,11 @@ def dont_starve(delta_card_ranges):
                 plan[j] -= reclaim_amount
                 free_card_count += reclaim_amount
 
-                # 如果还能回收，放回去
+                # 如果还能回收，放回到队尾重新排序
                 remaining = reclaimable_cards - reclaim_amount
                 if remaining > 0:
-                    reclaimable_tasks.append( (priority, j, remaining) )
-                    reclaimable_tasks.sort()
+                    reclaimable_tasks.append( (priority, remaining, j) )
+                    reclaimable_tasks.sort(key=lambda x: (-x[0], -x[1]))
 
     # ---------- 第三步: 计算富余卡 ----------
     excess_cards = free_card_count
@@ -292,10 +298,11 @@ def feed_more(delta_card_ranges, plan, excess_cards):
         neg_score, i = task_scores.pop(0)
         task = task_states[i]
         cards_per_instance = task.tp * task.pp
+        min_cards, max_cards = delta_card_ranges[i]
 
         # 检查上限
         current_cards = task.K_i * cards_per_instance + plan[i]
-        max_allowed = acceleration_limit_ratio * task.K_i_base * cards_per_instance
+        max_allowed = task.K_i * cards_per_instance + max_cards
         if current_cards >= max_allowed:
             continue
 
@@ -307,7 +314,7 @@ def feed_more(delta_card_ranges, plan, excess_cards):
             new_score = compute_allocation_score_with_plan(task, plan[i])
             if new_score > 0:
                 new_current = current_cards + cards_per_instance
-                if new_current < acceleration_limit_ratio * task.K_i_base * cards_per_instance:
+                if new_current < max_allowed:
                     task_scores.append( (-new_score, i) )
                     task_scores.sort()
 
