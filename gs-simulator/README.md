@@ -437,20 +437,31 @@ print(f"任务完成时间: {result.task_completion_times}")
 
 | 用例名 | 集群规模 | 任务数 | 并行策略(TP×PP) | 描述 | GS优化效果 |
 |--------|----------|--------|-----------------|------|------------|
-| BB1_two_tasks_competition | 32卡 | 2 | 4×2 (8卡/实例) | 双任务竞争，验证资源共享 | 13.6% |
-| BB2_three_tasks_mixed_parallelism | 32卡 | 3 | 混合(4×2, 8×1, 2×4) | 三任务混合并行策略 | 39.8% |
-| BB3_large_scale_two_tasks | 64卡 | 2 | 8×2 (16卡/实例) | 大规模双任务场景 | 10.3% |
-| BB4_four_tasks_small_scale | 32卡 | 4 | 4×2 (8卡/实例) | 四任务小规模调度 | 12.3% |
-| BB5_small_granularity_dense | 32卡 | 8 | 2×1, 4×1 | 小粒度密集任务（8任务竞争） | 13.5% |
-| BB6_mixed_parallelism | 32卡 | 4 | 2×1, 4×1, 4×2, 8×1 | 混合并行粒度（多种卡数混合） | 33.3% |
-| BB7_large_instance | 64卡 | 2 | 8×2 (16卡/实例) | 大实例场景（16卡/实例） | 8.2% |
-| BB8_fragmentation_test | 32卡 | 5 | 8×1, 4×1, 4×2 | 资源碎片化测试 | 7.8% |
-| BB9_strong_competition | 32卡 | 4 | 8×1 (8卡/实例) | 饱和竞争（4任务100%占用，相同并行策略） | 15.3% |
-| BB10_dynamic_scaling | 64卡 | 3 | 8×1 (8卡/实例) | 动态扩缩容（base差异大） | 12.9% |
-| BB11_heterogeneous_cluster | 64卡 | 6 | 混合(2, 4, 8, 16) | 异构集群（多种TP×PP混合） | 22.0% |
-| BB12_multi_task_diverse_longtail | 64卡 | 4 | 4×2 (8卡/实例) | 高调度密度（长尾差异大） | 39.9% |
+| BB1_two_tasks_competition | 32卡 | 2 | 4×2 (8卡/实例) | 双任务对称竞争，基础验证 | 12.0% |
+| BB2_three_tasks_mixed_parallelism | 32卡 | 3 | 混合(4×2, 8×1, 2×4) | **快慢分离**：2快任务→释放→给慢任务 | 38.6% |
+| BB3_large_scale_two_tasks | 64卡 | 2 | 8×2 (16卡/实例) | **不对称设计**：快任务早释放→给慢任务 | 5.5% |
+| BB4_four_tasks_small_scale | 32卡 | 4 | 4×2 (8卡/实例) | 四任务级联调度：顺序释放分配 | 11.2% |
+| BB5_small_granularity_dense | 32卡 | 8 | 2×1, 4×1 | 小粒度高频调度：8任务密集竞争 | 14.3% |
+| BB6_mixed_parallelism | 32卡 | 4 | 2×1, 4×1, 4×2, 8×1 | 多粒度资源匹配：小→中→大 | 22.4% |
+| BB7_large_instance | 64卡 | 2 | 8×2 (16卡/实例) | **对称设计**：两任务同时进行，调度机会少 | 1.8% |
+| BB8_fragmentation_test | 32卡 | 5 | 8×1, 4×1, 4×2 | 碎片重组：4卡+4卡→8卡任务 | 17.0% |
+| BB9_strong_competition | 32卡 | 4 | 8×1 (8卡/实例) | 饱和竞争：同策略，长尾差异驱动 | 12.6% |
+| BB10_dynamic_scaling | 64卡 | 3 | 8×1 (8卡/实例) | 动态扩缩容：base差异大(32/16/16) | 17.3% |
+| BB11_heterogeneous_cluster | 64卡 | 6 | 混合(2, 4, 8, 16) | 异构集群：4种粒度(2/4/8/16卡) | 17.5% |
+| BB12_multi_task_diverse_longtail | 64卡 | 4 | 4×2 (8卡/实例) | 高调度密度：长尾差异最大(20% vs 80%) | 29.2% |
 
 **注**: GS优化效果 = (无GS时间 - 有GS时间) / 无GS时间 × 100%
+
+### 调度场景分类
+
+| 场景类型 | 用例 | 核心机制 | GS效果范围 |
+|----------|------|----------|------------|
+| **早完成早释放** | BB3, BB10, BB12 | 快任务→释放→给慢任务 | 5-29% |
+| **快慢分离** | BB2 | 多快任务→释放→给慢任务 | **38%** (最高) |
+| **级联调度** | BB4, BB5 | 顺序释放分配循环 | 11-14% |
+| **多粒度匹配** | BB6, BB8, BB11 | 小粒度碎片重组 | 17-22% |
+| **长尾差异驱动** | BB9 | 同策略，长尾决定顺序 | 12% |
+| **对称无机会** | BB7 | 两任务同时进行 | **1.8%** (最小) |
 
 ### 长尾分布参数说明
 
@@ -468,18 +479,13 @@ print(f"任务完成时间: {result.task_completion_times}")
 
 ```python
 {
-    "test_case_name": "BB3_three_tasks_mixed_parallelism",
-    "total_simulation_time": 343.5,
+    "test_case_name": "BB3_large_scale_two_tasks",
+    "total_simulation_time": 14891.0,
     "task_completion_times": {
-        "task1": 51.0,
-        "task2": 323.5,
-        "task3": 343.5
+        "task1": 2056.0,
+        "task2": 14891.0
     },
-    "avg_task_completion_time": 239.33,
-    "slowest_task": ("task3", 343.5),
-    "fastest_task": ("task1", 51.0),
-    "scheduling_trace_count": 0,
-    "avg_utilization": 0.95
+    "scheduling_trace_count": 9
 }
 ```
 

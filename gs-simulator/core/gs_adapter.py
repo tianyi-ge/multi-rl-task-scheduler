@@ -660,7 +660,16 @@ class GSAdapter:
 
             # 记录 task_table_snapshot（关键日志：用于分析调度决策依据）
             if hasattr(self_gs, 'logger') and self_gs.logger:
-                self_gs.logger.log_task_table_snapshot(tasks_snapshot, cycle_id=cycle_id, trigger_source=trigger_source)
+                # 获取 num_rounds_map
+                num_rounds_map = None
+                if hasattr(self_gs, '_adapter') and self_gs._adapter.get_num_rounds_map_callback:
+                    num_rounds_map = self_gs._adapter.get_num_rounds_map_callback()
+                self_gs.logger.log_task_table_snapshot(
+                    tasks_snapshot,
+                    cycle_id=cycle_id,
+                    trigger_source=trigger_source,
+                    num_rounds_map=num_rounds_map
+                )
 
             # 调用四阶段算法（各自包含日志）
             delta_card_ranges = self_gs.assess_range(tasks_snapshot)
@@ -850,21 +859,28 @@ class GSAdapter:
         expand_callback: Callable[[str, List[str]], None],
         reclaim_callback: Callable[[str, List[str]], None],
         get_idle_workers_callback: Callable[[str], List[str]],
-        get_state_callback: Optional[Callable[[str], Any]] = None
+        get_state_callback: Optional[Callable[[str], Any]] = None,
+        get_num_rounds_map_callback: Optional[Callable[[], Dict[str, int]]] = None
     ) -> None:
         """设置仿真器的回调函数"""
         self.expand_callback = expand_callback
         self.reclaim_callback = reclaim_callback
         self.get_idle_workers_callback = get_idle_workers_callback
         self.get_state_callback = get_state_callback
+        self.get_num_rounds_map_callback = get_num_rounds_map_callback
 
-    def register_task(self, task_config: Any, worker_ids: List[str] = None) -> bool:
+    def register_task(self, task_config: Any) -> bool:
         """
         注册任务到GroupScheduler
 
+        【正确流程】直接调用gs.register_task()，GS会自动：
+        1. 注册任务到TaskTable
+        2. 设置mock callbacks
+        3. 触发调度（trigger_schedule）
+        4. 调度完成后通过assign回调分配实例
+
         Args:
             task_config: TaskConfig对象（来自models/task_config.py）
-            worker_ids: 初始分配的worker ID列表（与仿真器同步）
 
         Returns:
             是否注册成功
@@ -878,29 +894,15 @@ class GSAdapter:
             total_samples=task_config.total_samples
         )
 
-        # 【修复】直接调用 tasks.register() 而不是 gs.register_task()
-        # 原因：gs.register_task() 会立即触发调度，此时状态还未上报
-        # 改为：先注册任务，等待后续 report_state 时再触发调度
-        success = self.gs.tasks.register(gs_config)
+        # 【修改】使用 gs.register_task() 自动触发调度
+        # gs.register_task() 内部会调用 trigger_schedule()
+        success = self.gs.register_task(gs_config)
 
         # Patch TaskInfo with mock callbacks (在注册之后立即设置）
         if success:
             task_info = self.gs.tasks.get_task(task_config.task_id)
             task_info.revoke = MockRevokeCallable(self, task_config.task_id)
             task_info.assign = MockAssignCallable(self, task_config.task_id)
-            # 【修复】初始化_used_workers，让GS知道这些worker已被占用
-            if worker_ids:
-                task_info._used_workers = worker_ids.copy()
-
-        # 同步初始worker分配状态
-        if success and worker_ids:
-            self.allocated_workers[task_config.task_id] = worker_ids.copy()
-            # 从GS的idle列表中移除已分配的worker
-            self.gs.workers.del_workers_from_idle(worker_ids)
-
-        # 触发调度，让GS自动分配实例
-        if success:
-            self.gs.trigger_schedule()
 
         return success
 
@@ -918,9 +920,8 @@ class GSAdapter:
         Returns:
             是否成功
         """
-        # 记录日志
-        if self.logger:
-            self.logger.log_report_state(state.task_id, state, need_schedule)
+        # 注意：日志记录已在 simulator.py 中完成，此处不再重复记录
+        # 避免 total_rounds 显示为 "unknown" 的问题
 
         # 设置触发来源标记（用于日志关联）
         if need_schedule:

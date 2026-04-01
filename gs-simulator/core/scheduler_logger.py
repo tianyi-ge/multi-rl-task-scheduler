@@ -188,7 +188,7 @@ class SchedulerLogger:
         with open(self.log_file, "a") as f:
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
-    def log_report_state(self, task_id, state, need_schedule: bool, simulation_step: Optional[int] = None, current_time: Optional[float] = None) -> None:
+    def log_report_state(self, task_id, state, need_schedule: bool, simulation_step: Optional[int] = None, current_time: Optional[float] = None, num_rounds: Optional[int] = None) -> None:
         """记录任务状态上报"""
         log_entry = {
             'timestamp': self.get_timestamp(),
@@ -201,7 +201,11 @@ class SchedulerLogger:
                 'idle_instances': state.idle_instances,
                 'busy_instances': state.busy_instances,
                 'in_rollout_phase': state.in_rollout_phase,
-                'has_voluntary_reclaim': state.voluntary_reclaim is not None
+                'has_voluntary_reclaim': state.voluntary_reclaim is not None,
+                # 新增轮次进度
+                'done_rounds': state.done_rounds,
+                'total_rounds': num_rounds if num_rounds is not None else 'unknown',
+                'current_round': state.done_rounds + 1 if num_rounds is not None else 'unknown'
             },
             'need_schedule': need_schedule
         }
@@ -212,7 +216,56 @@ class SchedulerLogger:
             log_entry['current_time'] = current_time
         self._write_jsonl(log_entry)
 
-    def log_task_table_snapshot(self, task_table, cycle_id=None, trigger_source=None):
+    def log_round_progress(self, task_id: str, done_rounds: int, num_rounds: int,
+                           done_samples: int, remaining_samples: int,
+                           current_round: int, samples_in_current_round: int,
+                           simulation_step: Optional[int] = None,
+                           current_time: Optional[float] = None) -> None:
+        """记录轮次进度状态"""
+        log_entry = {
+            'timestamp': self.get_timestamp(),
+            'event': 'round_progress',
+            'task_id': task_id,
+            'round_status': {
+                'current_round': current_round,           # 当前轮次 (1-based)
+                'total_rounds': num_rounds,               # 总轮数
+                'done_rounds': done_rounds,               # 已完成轮数
+                'remaining_rounds': num_rounds - done_rounds,  # 剩余轮数
+                'done_samples': done_samples,             # 已完成样本总数
+                'remaining_samples': remaining_samples,   # 剩余样本总数
+                'samples_in_current_round': samples_in_current_round  # 当前轮次剩余样本
+            }
+        }
+        if simulation_step is not None:
+            log_entry['simulation_step'] = simulation_step
+        if current_time is not None:
+            log_entry['current_time'] = current_time
+        self._write_jsonl(log_entry)
+
+    def log_round_transition(self, task_id: str, from_round: int, to_round: int,
+                             num_rounds: int, instance_count: int,
+                             simulation_step: Optional[int] = None,
+                             current_time: Optional[float] = None) -> None:
+        """记录轮次切换事件"""
+        log_entry = {
+            'timestamp': self.get_timestamp(),
+            'event': 'round_transition',
+            'task_id': task_id,
+            'transition': {
+                'from_round': from_round,
+                'to_round': to_round,
+                'total_rounds': num_rounds,
+                'remaining_rounds': num_rounds - to_round,
+                'instance_count': instance_count  # 进入下一轮时的实例数
+            }
+        }
+        if simulation_step is not None:
+            log_entry['simulation_step'] = simulation_step
+        if current_time is not None:
+            log_entry['current_time'] = current_time
+        self._write_jsonl(log_entry)
+
+    def log_task_table_snapshot(self, task_table, cycle_id=None, trigger_source=None, num_rounds_map: Optional[Dict[str, int]] = None):
         """记录 task_table 快照状态"""
         snapshot = {
             'timestamp': self.get_timestamp(),
@@ -229,6 +282,10 @@ class SchedulerLogger:
                     'remaining_samples': task.remaining_samples,
                     'done_samples': task.done_samples,
                     'done_rounds': task.done_rounds,
+                    # 新增轮次进度
+                    'total_rounds': num_rounds_map.get(task_id, 'unknown') if num_rounds_map else 'unknown',
+                    'current_round': task.done_rounds + 1,
+                    'remaining_rounds': (num_rounds_map.get(task_id, 0) - task.done_rounds) if num_rounds_map else 'unknown'
                 }
                 for task_id, task in task_table._task_table.items()
             }

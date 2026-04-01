@@ -68,13 +68,11 @@ class Simulator:
         self.gs_adapter: Optional[GSAdapter] = None
         self.logger: Optional[SchedulerLogger] = None
 
-        if enable_gs:
-            # 创建日志器（仅当log_dir不为None时）
-            if log_dir:
-                self.logger = SchedulerLogger(log_dir=log_dir)
-            else:
-                self.logger = None
+        # 创建日志器（无论是否启用GS，都记录轮次进度）
+        if log_dir:
+            self.logger = SchedulerLogger(log_dir=log_dir)
 
+        if enable_gs:
             # 创建 GS适配器（使用 ClusterConfig 对齐）
             self.gs_adapter = GSAdapter(
                 machine_count=test_case.cluster.machine_count,
@@ -87,7 +85,8 @@ class Simulator:
                 expand_callback=self._on_gs_expand,
                 reclaim_callback=self._on_gs_reclaim,
                 get_idle_workers_callback=self._get_idle_workers_for_task,
-                get_state_callback=self._get_task_state_for_gs
+                get_state_callback=self._get_task_state_for_gs,
+                get_num_rounds_map_callback=self._get_num_rounds_map
             )
 
         # 初始化
@@ -106,7 +105,7 @@ class Simulator:
                 pp=task_config.pp,
                 base_instances=task_config.base_instances,
                 samples_per_round=task_config.samples_per_round,
-                total_samples=task_config.total_samples,
+                num_rounds=task_config.num_rounds,
                 random_seed=42 + hash(task_config.task_id),
                 time_distribution=task_config.time_distribution,
                 distribution_params=task_config.distribution_params
@@ -118,23 +117,12 @@ class Simulator:
 
             # 注册到GS（GS会自动触发调度并分配实例）
             if self.gs_adapter:
-                # 【修复】GS模式下也预先分配实例，确保和无GS模式相同的启动时机
-                # 原因：如果等待GS调度分配，会有约6秒延迟（GS调度周期+状态上报延迟）
-                # 修复：先分配实例，再向GS注册并上报状态，让GS知道这些worker已被占用
-                task.init_instances(task_config.base_instances, self.cluster)
-
-                # 收集已分配实例的worker IDs
-                worker_ids = []
-                for inst in task.instances:
-                    for gpu in inst.gpus:
-                        worker_id = gpu.machine_id * NPUS_PER_NODE + gpu.gpu_id
-                        worker_ids.append(str(worker_id))
-
-                # 注册任务到GS，带上已分配的worker IDs
-                success = self.gs_adapter.register_task(task_config, worker_ids=worker_ids)
+                # 【正确流程】直接注册任务，让GS调度空闲实例并分配
+                # 不预先分配实例，等待GS通过回调分配
+                success = self.gs_adapter.register_task(task_config)
                 if success:
-                    print(f"任务 {task_config.task_id} 注册成功，base_instances={task_config.base_instances}, worker_ids={len(worker_ids)}")
-                    # 等待GS调度完成（GS会根据初始状态触发调度，但此时worker已被占用）
+                    print(f"任务 {task_config.task_id} 注册成功，等待GS分配实例")
+                    # 等待GS完成初始调度和分配（通过_on_gs_expand回调）
                     self.gs_adapter._wait_for_gs_scheduling()
                 else:
                     print(f"任务 {task_config.task_id} 注册失败")
@@ -165,6 +153,22 @@ class Simulator:
             # 上报状态到GS（触发调度）
             if self.enable_gs and step > 0:
                 self._report_all_task_states(current_time, step)
+            else:
+                # 无GS模式：记录轮次进度（不触发调度）
+                if self.logger and step > 0:
+                    for task in self.tasks.values():
+                        current_round_remaining = task.sample_queue.available_samples + task.sample_queue.locked_samples
+                        self.logger.log_round_progress(
+                            task_id=task.task_id,
+                            done_rounds=task.done_rounds,
+                            num_rounds=task.num_rounds,
+                            done_samples=task.done_samples,
+                            remaining_samples=task.total_samples - task.done_samples,
+                            current_round=task.done_rounds + 1,
+                            samples_in_current_round=current_round_remaining,
+                            simulation_step=step,
+                            current_time=current_time
+                        )
 
             # 定期记录
             if step % record_interval == 0:
@@ -196,23 +200,24 @@ class Simulator:
         if not self.gs_adapter:
             return
 
-        # 1. 检查并释放已完成任务的worker和GPU
-        # 修复：当任务完成所有样本时，即使phase还未被设为DONE，也应该标记为DONE并释放资源
+        # 1. 只在所有轮次完成时释放实例（多轮迭代仿真）
+        # 关键修改：不在每轮完成时释放，保留分配状态让GS进行"失衡→平衡"调度
         for task in self.tasks.values():
-            # 检查任务是否真正完成（所有样本都处理完毕）
+            # 检查任务是否所有轮次完成（所有样本都处理完）
             if task.done_samples >= task.total_samples:
                 if task.phase != TaskPhase.DONE:
                     # 标记任务为完成
                     task.phase = TaskPhase.DONE
                     task.end_time = current_time
-                    print(f"  {task.task_id}: 检测到完成，标记为DONE并释放资源")
+                    print(f"  {task.task_id}: 所有轮次完成，标记为DONE并释放资源")
 
+            # 只在DONE时释放实例（不是每轮完成）
             if task.phase == TaskPhase.DONE and not task.workers_released:
                 # 释放GPU资源
                 for inst in task.instances:
                     self.cluster.reclaim_gpus(inst.gpus)
 
-                # 清空实例列表（修复：否则上报状态时仍显示有实例）
+                # 清空实例列表
                 task.instances.clear()
 
                 # 释放GS worker
@@ -228,8 +233,8 @@ class Simulator:
                 task.workers_released = True
                 print(f"  {task.task_id}: 释放了所有实例和资源")
 
-        # 2. 主动释放空闲实例并回收GPU资源
-        # 逻辑：释放空闲实例，但保留至少 base_instances 个实例
+        # 2. 轮次进行中的动态回收（通过 voluntary_reclaim 机制）
+        # 注意：release_idle_instances 在轮次切换时不应触发（见 task.py 的修改）
         for task in self.tasks.values():
             if task.phase == TaskPhase.ROLLOUT:
                 reclaimed_gpus = task.release_idle_instances(self.cluster)
@@ -243,13 +248,39 @@ class Simulator:
                         self.gs_adapter.allocated_workers[task.task_id] = [
                             w for w in self.gs_adapter.allocated_workers[task.task_id] if w not in worker_id_set
                         ]
-                    print(f"  [主动回收] {task.task_id} 释放了 {len(reclaimed_gpus)} 张卡 ({len(worker_ids)} workers)")
+                    print(f"  [动态回收] {task.task_id} 释放了 {len(reclaimed_gpus)} 张卡 ({len(worker_ids)} workers)")
 
-        # 3. 上报所有任务状态到GS
+        # 3. 记录轮次进度（每个任务）
+        for task in self.tasks.values():
+            if self.logger:
+                # 计算当前轮次剩余样本
+                current_round_remaining = task.sample_queue.available_samples + task.sample_queue.locked_samples
+
+                self.logger.log_round_progress(
+                    task_id=task.task_id,
+                    done_rounds=task.done_rounds,
+                    num_rounds=task.num_rounds,
+                    done_samples=task.done_samples,
+                    remaining_samples=task.total_samples - task.done_samples,
+                    current_round=task.done_rounds + 1,
+                    samples_in_current_round=current_round_remaining,
+                    simulation_step=step,
+                    current_time=current_time
+                )
+
+        # 4. 上报所有任务状态到GS（触发调度）
+        # GS会根据 current_instances vs base_instances 进行"失衡→平衡"调度
         states_reported = 0
         for task in self.tasks.values():
             state = task.get_state_report_for_gs()
             if state:
+                # 记录状态上报（含轮次信息）
+                if self.logger:
+                    self.logger.log_report_state(
+                        task.task_id, state, need_schedule=True,
+                        simulation_step=step, current_time=current_time,
+                        num_rounds=task.num_rounds
+                    )
                 self.gs_adapter.report_state(state, need_schedule=True)
                 states_reported += 1
         if step % 10 == 0:
@@ -315,20 +346,17 @@ class Simulator:
         else:
             inst.communication_factor = 1.0
 
-        # 预计算推理时间 - 从当前进度开始
-        # 新实例从done_samples处开始处理剩余样本
-        # 使用sample_start_index确保种子一致性
-        remaining_samples = task.total_samples - task.done_samples
-        if remaining_samples > 0:
-            inst.precompute_inference_times(
-                total_samples=remaining_samples,  # 只需要计算剩余样本的时间
-                tp=task.tp,
-                pp=task.pp,
-                time_distribution=task.time_distribution,
-                distribution_params=task.distribution_params,
-                random_seed=task.random_seed,  # 使用任务原始种子，不添加偏移
-                sample_start_index=task.done_samples  # 从当前进度开始
-            )
+        # 预计算推理时间表
+        # 【公平性设计】使用相同的任务种子，确保同一个 sample 在任何实例上
+        # 都有相同的推理时间，保证无GS和有GS方案公平比较
+        inst.precompute_inference_times(
+            total_samples=task.total_samples,
+            tp=task.tp,
+            pp=task.pp,
+            time_distribution=task.time_distribution,
+            distribution_params=task.distribution_params,
+            random_seed=task.random_seed
+        )
 
         task.instances.append(inst)
         inst.cold_start_end_time = self.clock.peek_time() + 5.0  # 冷启动时间固定为5秒
@@ -345,36 +373,140 @@ class Simulator:
         worker_id_set = set(int(w) for w in worker_ids)
         instances_to_remove = []
 
+        # 【关键修复】只移除超过base_instances的部分
+        max_to_remove = len(task.instances) - task.base_instances
+
         for inst in task.instances:
+            if len(instances_to_remove) >= max_to_remove:
+                # 已经找到足够的实例，不再继续
+                break
             inst_worker_ids = [gpu.machine_id * NPUS_PER_NODE + gpu.gpu_id for gpu in inst.gpus]
             # 如果实例的所有worker都在回收列表中，则移除该实例
             if all(w in worker_id_set for w in inst_worker_ids):
                 instances_to_remove.append(inst)
 
         # 移除实例并回收GPU
+        reclaimed_workers = []
+        samples_returned = 0
         for inst in instances_to_remove:
-            # 回收GPU
+            # 【关键修复】BUSY实例需要把样本放回队列
+            if inst.state == InstanceState.BUSY:
+                # 样本正在处理中，需要放回队列让其他实例处理
+                # 【关键】传递原始索引，确保推理时间正确
+                task.sample_queue.return_sample(inst.current_global_index)
+                samples_returned += 1
+                print(f"  [BUSY回收] {task_id} 样本{inst.current_global_index}放回队列")
+
+            # 回收GPU到集群
             self.cluster.reclaim_gpus(inst.gpus)
+            # 记录被回收的worker IDs
+            for gpu in inst.gpus:
+                worker_id = gpu.machine_id * NPUS_PER_NODE + gpu.gpu_id
+                reclaimed_workers.append(str(worker_id))
             # 移除实例
             task.instances.remove(inst)
 
+        # 【关键修复】将回收的workers加回GS的idle列表
+        # 这样后续的分配才能找到空闲workers
+        if reclaimed_workers and self.gs_adapter:
+            self.gs_adapter.gs.workers.add_workers_to_idle(reclaimed_workers)
+            # 更新allocated_workers记录
+            if task_id in self.gs_adapter.allocated_workers:
+                worker_id_set = set(reclaimed_workers)
+                self.gs_adapter.allocated_workers[task_id] = [
+                    w for w in self.gs_adapter.allocated_workers[task_id] if w not in worker_id_set
+                ]
+
         if instances_to_remove:
-            print(f"  缩容: {task_id} -> {len(task.instances)}实例")
+            msg = f"  缩容: {task_id} -> {len(task.instances)}实例, 释放{len(reclaimed_workers)}workers到GS"
+            if samples_returned > 0:
+                msg += f", {samples_returned}样本放回队列"
+            print(msg)
 
     def _get_idle_workers_for_task(self, task_id: str) -> List[str]:
-        """获取任务的空闲worker IDs"""
+        """
+        获取任务可回收的worker IDs
+
+        【关键约束】必须保护base_instances：
+        1. 任务DONE时：所有实例可回收
+        2. 长尾场景（有BUSY实例处理慢样本，有IDLE实例完成快样本）：
+           - 可以回收IDLE实例给其他任务使用（资源动态分配）
+           - 只保护base_instances数量
+        3. 轮次切换（所有实例都IDLE且无样本）：
+           - 不回收，保留实例等待下一轮
+
+        Returns:
+            可回收的worker ID列表
+        """
         task = self.tasks.get(task_id)
         if not task:
             return []
 
-        idle_workers = []
-        for inst in task.instances:
-            if inst.state == InstanceState.IDLE:
+        reclaimable_workers = []
+
+        # 1. 任务DONE：所有实例可回收
+        if task.phase == TaskPhase.DONE:
+            for inst in task.instances:
                 for gpu in inst.gpus:
                     worker_id = gpu.machine_id * NPUS_PER_NODE + gpu.gpu_id
-                    idle_workers.append(str(worker_id))
+                    reclaimable_workers.append(str(worker_id))
+            return reclaimable_workers
 
-        return idle_workers
+        # 2. 检查是否有样本待处理
+        remaining_total = task.total_samples - task.done_samples
+        if remaining_total == 0:
+            # 任务完成所有样本，即将标记为DONE
+            return []
+
+        # 3. 统计实例状态
+        idle_instances = [inst for inst in task.instances if inst.state == InstanceState.IDLE]
+        busy_instances = [inst for inst in task.instances if inst.state == InstanceState.BUSY]
+        cold_starting = [inst for inst in task.instances if inst.state == InstanceState.COLD_STARTING]
+
+        total_instances = len(task.instances)
+
+        # 4. 【长尾场景关键】当有BUSY实例时，可以回收IDLE实例
+        # 原因：BUSY实例处理长尾样本需要时间，IDLE实例已经完成快样本
+        # 可以把IDLE实例的资源给其他任务，实现负载均衡
+        if busy_instances or cold_starting:
+            # 有实例在忙：可以回收IDLE实例（最多回收到保留base_instances）
+            excess_instances = total_instances - task.base_instances
+
+            if excess_instances > 0 and idle_instances:
+                # 回收IDLE实例（最多excess个）
+                for inst in idle_instances[:excess_instances]:
+                    for gpu in inst.gpus:
+                        worker_id = gpu.machine_id * NPUS_PER_NODE + gpu.gpu_id
+                        reclaimable_workers.append(str(worker_id))
+
+            # 如果还有超额BUSY实例，也可以回收
+            remaining_excess = excess_instances - len(idle_instances)
+            if remaining_excess > 0:
+                for inst in busy_instances[:remaining_excess]:
+                    for gpu in inst.gpus:
+                        worker_id = gpu.machine_id * NPUS_PER_NODE + gpu.gpu_id
+                        reclaimable_workers.append(str(worker_id))
+
+            return reclaimable_workers
+
+        # 5. 所有实例都IDLE且无BUSY：轮次切换场景
+        # 检查是否还有下一轮样本
+        if idle_instances and not busy_instances:
+            # 所有实例都空闲
+            if task.sample_queue.available_samples > 0:
+                # 有样本待处理，实例会继续工作
+                return []
+
+            # 无样本：等待下一轮，保留base_instances
+            # 但可以回收超过base的实例
+            excess_instances = total_instances - task.base_instances
+            if excess_instances > 0:
+                for inst in idle_instances[:excess_instances]:
+                    for gpu in inst.gpus:
+                        worker_id = gpu.machine_id * NPUS_PER_NODE + gpu.gpu_id
+                        reclaimable_workers.append(str(worker_id))
+
+        return reclaimable_workers
 
     def _get_task_state_for_gs(self, task_id: str) -> Any:
         """获取任务的当前状态（用于GS回调时同步状态）"""
@@ -382,6 +514,10 @@ class Simulator:
         if not task:
             return None
         return task.get_state_report_for_gs()
+
+    def _get_num_rounds_map(self) -> Dict[str, int]:
+        """获取所有任务的 num_rounds 映射（用于日志记录）"""
+        return {task_id: task.num_rounds for task_id, task in self.tasks.items()}
 
     def _has_active_tasks(self) -> bool:
         """检查是否有活动任务"""

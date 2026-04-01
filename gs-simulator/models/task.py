@@ -19,32 +19,92 @@ class TaskPhase(Enum):
 
 @dataclass
 class SampleQueue:
-    """每轮迭代的样本队列"""
-    samples_per_round: int  # 本轮总样本数
+    """样本队列 - 使用全局索引跟踪进度"""
+    total_samples: int  # 总样本数
+    samples_per_round: int  # 每轮样本数（用于进度显示）
     round_id: int = 0
-    available_samples: int = field(init=False, default=0)
-    locked_samples: int = 0  # 已被实例取走的样本数
+    available_samples: int = field(init=False, default=0)  # 本轮剩余可用样本
+    locked_samples: int = 0  # 已被实例取走但未完成的样本数
+    next_global_index: int = 0  # 下一个要分配的全局样本索引
+    returned_indices: List[int] = field(default_factory=list)  # 【新增】放回队列的样本索引列表
 
     def __post_init__(self):
-        self.available_samples = self.samples_per_round
+        # 第一轮的可用样本数
+        self.available_samples = min(self.samples_per_round, self.total_samples)
 
-    def try_lock_samples(self, count: int) -> bool:
-        """尝试锁定count个样本（实例取样本时调用）"""
+    def try_lock_samples(self, count: int) -> Optional[int]:
+        """
+        尝试锁定count个样本（实例取样本时调用）
+
+        Returns:
+            全局样本索引（成功时），None（失败时）
+        """
+        # 检查本轮是否还有可用样本（包括放回队列的样本）
         if self.available_samples >= count:
             self.available_samples -= count
             self.locked_samples += count
-            return True
-        return False
+
+            # 【优先】检查是否有放回队列的样本索引
+            if self.returned_indices:
+                # 使用放回的索引（确保正确的推理时间）
+                idx = self.returned_indices.pop(0)
+                return idx
+
+            # 检查是否还有未分配的全局样本索引
+            if self.next_global_index < self.total_samples:
+                idx = self.next_global_index
+                self.next_global_index += count
+                return idx
+
+        return None
 
     def unlock_samples(self, count: int) -> None:
         """完成count个样本（推理完成后调用）"""
         self.locked_samples -= count
 
-    def next_round(self) -> None:
-        """进入下一轮"""
+    def return_sample(self, original_index: int) -> None:
+        """
+        把样本放回队列（BUSY实例被强制回收时调用）
+
+        Args:
+            original_index: 原始样本索引（必须保留，确保正确的推理时间）
+
+        当GS需要回收超过base_instances的BUSY实例时，样本正在处理中
+        但还没完成，需要放回队列让其他实例处理。
+
+        注意：
+        - 保留原始索引，确保推理时间正确（预计算表使用索引）
+        - 这与unlock_samples不同：unlock是样本完成了，return是样本被中止
+        """
+        if self.locked_samples > 0:
+            self.locked_samples -= 1
+            self.available_samples += 1
+            # 【关键】记录放回的索引，后续分配时使用
+            self.returned_indices.append(original_index)
+
+    def check_round_complete(self, done_samples: int) -> bool:
+        """
+        检查当前轮是否完成
+
+        Returns:
+            True 如果本轮所有样本都已完成，False 否则
+        """
+        # 本轮完成条件：所有取走的样本都已完成，且本轮可用样本也已耗尽
+        return (self.locked_samples == 0 and self.available_samples == 0)
+
+    def next_round(self) -> bool:
+        """
+        进入下一轮
+
+        Returns:
+            True 如果还有更多轮次，False 如果所有样本已分配完毕
+        """
         self.round_id += 1
-        self.available_samples = self.samples_per_round
+        # 计算下一轮的可用样本数
+        remaining_total = self.total_samples - self.next_global_index
+        self.available_samples = min(self.samples_per_round, remaining_total)
         self.locked_samples = 0
+        return remaining_total > 0
 
 
 @dataclass
@@ -74,8 +134,11 @@ class TaskModel:
     pp: int
     base_instances: int
     samples_per_round: int
-    total_samples: int
+    num_rounds: int  # 新增：迭代轮数
     random_seed: int
+
+    # total_samples 自动计算
+    total_samples: int = field(init=False)
 
     # 时间分布参数
     time_distribution: str = "longtail_normal"
@@ -93,23 +156,31 @@ class TaskModel:
     reclaimed_workers_cache: List[GPUPlacement] = field(default_factory=list)  # 缓存已回收的worker信息
 
     def __post_init__(self):
-        self.sample_queue = SampleQueue(samples_per_round=self.samples_per_round)
+        """自动计算总样本数并初始化样本队列"""
+        self.total_samples = self.samples_per_round * self.num_rounds
+        self.sample_queue = SampleQueue(
+            total_samples=self.total_samples,
+            samples_per_round=self.samples_per_round
+        )
 
     def release_idle_instances(self, cluster: ClusterModel) -> List[GPUPlacement]:
         """
-        主动释放空闲实例
+        动态释放空闲实例
 
-        逻辑：
-        1. 如果任务已经完成（所有sample推理完），释放所有实例
-        2. 如果所有实例都处于空闲状态（刚刚推理完），释放所有实例
-        3. 不能释放 BUSY 或 COLD_STARTING 状态的实例
+        【关键约束】保护base_instances：
+        1. 任务DONE时：释放所有实例
+        2. 长尾场景（有BUSY实例处理慢样本，有IDLE实例完成快样本）：
+           - 可以释放超过base_instances的IDLE实例给其他任务
+           - 实现资源动态分配和负载均衡
+        3. 轮次切换（所有实例都IDLE且无样本）：
+           - 保留实例等待下一轮
 
         Returns:
             被释放的GPU placement列表
         """
         self.reclaimed_workers_cache.clear()
 
-        # 如果任务已经完成，释放所有实例
+        # 所有轮次完成 → 释放所有实例
         if self.phase == TaskPhase.DONE:
             for inst in self.instances:
                 cluster.reclaim_gpus(inst.gpus)
@@ -126,15 +197,41 @@ class TaskModel:
         if not idle_instances:
             return []
 
-        # 如果所有实例都处于空闲状态（刚刚推理完），释放所有实例
-        if not busy_instances and not cold_starting_instances:
-            for inst in idle_instances:
-                cluster.reclaim_gpus(inst.gpus)
-                self.reclaimed_workers_cache.extend(inst.gpus)
-                self.instances.remove(inst)
-            return self.reclaimed_workers_cache
+        total_instances = len(self.instances)
 
-        # 否则不释放（有实例还在工作）
+        # 【长尾场景关键】当有BUSY实例时，可以释放IDLE实例
+        if busy_instances or cold_starting_instances:
+            # 有实例在忙（处理长尾样本）
+            # 可以释放超过base_instances的IDLE实例给其他任务
+            excess_instances = total_instances - self.base_instances
+
+            if excess_instances > 0:
+                # 只释放超额的IDLE实例（最多excess个）
+                for inst in idle_instances[:excess_instances]:
+                    cluster.reclaim_gpus(inst.gpus)
+                    self.reclaimed_workers_cache.extend(inst.gpus)
+                    self.instances.remove(inst)
+                return self.reclaimed_workers_cache
+
+            # 没有超额实例，不释放（保护base_instances）
+            return []
+
+        # 所有实例都空闲：轮次切换场景
+        if not busy_instances and not cold_starting_instances:
+            # 检查是否还有下一轮样本
+            remaining_samples = self.total_samples - self.done_samples
+            if remaining_samples > 0:
+                # 还有下一轮 → 保留实例等待下一轮
+                return []
+            else:
+                # 所有样本完成 → 释放所有实例
+                for inst in idle_instances:
+                    cluster.reclaim_gpus(inst.gpus)
+                    self.reclaimed_workers_cache.extend(inst.gpus)
+                    self.instances.remove(inst)
+                return self.reclaimed_workers_cache
+
+        # 本轮还有样本 → 空闲实例继续处理，不释放
         return []
 
     def init_instances(self, base_count: int, cluster: ClusterModel) -> None:
@@ -152,17 +249,17 @@ class TaskModel:
                     state=InstanceState.COLD_STARTING
                 )
 
-                # 预计算所有样本的推理时间
-                # 所有实例使用相同的种子，sample_start_index=0
-                # 这样无GS和有GS模式下，初始实例的时间表完全一致
+                # 预计算所有样本的推理时间表
+                # 【公平性设计】推理时间只由全局样本索引决定
+                # 同一个 sample 在任何实例上都有相同的推理时间
+                # 确保无GS和有GS方案公平比较
                 inst.precompute_inference_times(
                     total_samples=self.total_samples,
                     tp=self.tp,
                     pp=self.pp,
                     time_distribution=self.time_distribution,
                     distribution_params=self.distribution_params,
-                    random_seed=self.random_seed,
-                    sample_start_index=0  # 初始实例从头开始
+                    random_seed=self.random_seed
                 )
 
                 self.instances.append(inst)
@@ -181,15 +278,19 @@ class TaskModel:
     def _step_instance(self, inst: Instance, current_time: float) -> None:
         """推进单个实例的状态 - 使用预计算的推理时间
 
-        关键改进：冷启动完成后直接转为BUSY（如果有样本），不经过IDLE
-        只有真正没有样本可取时才变成IDLE
+        关键改进：
+        1. 冷启动完成后直接转为BUSY（如果有样本）
+        2. 使用全局样本索引确保不同实例处理不同样本
+        3. 每个实例的推理时间由全局样本索引决定（体现长尾效应）
         """
         # 冷启动检查：冷启动完成后直接转为 BUSY（如果有样本）
         if inst.state == InstanceState.COLD_STARTING:
             # 冷启动后立即尝试取样本，如果有样本则直接进入BUSY状态
-            if self.sample_queue.try_lock_samples(1):
+            global_idx = self.sample_queue.try_lock_samples(1)
+            if global_idx is not None:
                 inst.state = InstanceState.BUSY
                 inst.current_sample_start_time = current_time
+                inst.current_global_index = global_idx  # 记录当前处理的全局样本索引
             else:
                 # 只有真正没有样本时才变成IDLE
                 inst.state = InstanceState.IDLE
@@ -197,24 +298,23 @@ class TaskModel:
 
         # 空闲实例尝试取样本
         if inst.state == InstanceState.IDLE:
-            if self.sample_queue.try_lock_samples(1):
+            global_idx = self.sample_queue.try_lock_samples(1)
+            if global_idx is not None:
                 inst.state = InstanceState.BUSY
                 inst.current_sample_start_time = current_time
+                inst.current_global_index = global_idx
             return
 
         # 忙实例检查是否完成
         if inst.state == InstanceState.BUSY:
-            # 检查是否已处理完该实例的所有样本
-            if inst.current_sample_index >= len(inst.inference_time_table):
-                # 该实例的样本已全部完成，尝试取下一个
-                if self.sample_queue.try_lock_samples(1):
-                    inst.state = InstanceState.BUSY
-                    inst.current_sample_start_time = current_time
-                else:
-                    inst.state = InstanceState.IDLE
+            # 检查是否已处理完所有样本
+            if inst.current_global_index >= self.total_samples:
+                # 任务已完成，转为IDLE
+                inst.state = InstanceState.IDLE
                 return
 
-            inference_time = inst.inference_time_table[inst.current_sample_index]
+            # 获取当前样本的推理时间（基于全局索引）
+            inference_time = inst.get_inference_time_for_sample(inst.current_global_index)
 
             # 如果是第一次推理（未应用过冷启动时间），加上冷启动时间
             actual_inference_time = inference_time
@@ -229,32 +329,42 @@ class TaskModel:
                 self.sample_queue.unlock_samples(1)
                 self.done_samples += 1
                 inst.samples_processed += 1
-                inst.current_sample_index += 1
                 inst.current_sample_start_time = 0.0
 
-                # 调试输出：每完成一个样本输出一次
+                # 调试输出：每完成10个样本输出一次
                 if self.done_samples % 10 == 0 or self.done_samples == self.total_samples:
                     print(f"    {self.task_id}: 完成 {self.done_samples}/{self.total_samples} 样本")
 
-                # 检查本轮是否完成
-                if (self.sample_queue.available_samples == 0 and
-                    self.sample_queue.locked_samples == 0):
-                    # 本轮完成
+                # 检查任务是否完成（所有样本都处理完）→ 所有轮次完成
+                if self.done_samples >= self.total_samples:
+                    self.phase = TaskPhase.DONE
+                    self.end_time = current_time
+                    print(f"    {self.task_id}: 所有轮次完成！总轮数: {self.done_rounds + 1}, 总时间: {current_time:.1f}s")
+                    inst.state = InstanceState.IDLE
+                    return
+
+                # 检查本轮是否完成（本轮样本处理完，但还有下一轮）
+                if self.sample_queue.check_round_complete(self.done_samples):
+                    # 本轮完成，进入下一轮
                     self.done_rounds += 1
-                    if self.done_rounds * self.samples_per_round >= self.total_samples:
-                        self.phase = TaskPhase.DONE
-                        self.end_time = current_time
-                        print(f"    {self.task_id}: 完成！总时间: {current_time:.1f}s")
-                    else:
-                        self.sample_queue.next_round()
+                    print(f"    {self.task_id}: 第 {self.done_rounds} 轮完成")
+
+                    # 进入下一轮（不释放实例，保留分配状态）
+                    if self.sample_queue.next_round():
+                        print(f"    {self.task_id}: 进入第 {self.done_rounds + 1} 轮，实例保持IDLE等待新样本")
+                        # 还有更多轮次，实例保持IDLE状态等待新样本
+                        # 不释放实例，保留上一轮的分配状态（可能失衡）
+                    # else: 所有样本已分配完毕，等待现有样本完成
 
                 # 尝试取下一个样本（如果有样本则继续BUSY，否则变IDLE）
-                if (self.phase == TaskPhase.ROLLOUT and
-                    self.sample_queue.try_lock_samples(1)):
-                    inst.state = InstanceState.BUSY
-                    inst.current_sample_start_time = current_time
-                else:
-                    inst.state = InstanceState.IDLE
+                if self.phase == TaskPhase.ROLLOUT:
+                    global_idx = self.sample_queue.try_lock_samples(1)
+                    if global_idx is not None:
+                        inst.state = InstanceState.BUSY
+                        inst.current_sample_start_time = current_time
+                        inst.current_global_index = global_idx
+                    else:
+                        inst.state = InstanceState.IDLE
 
     def get_state_report(self) -> TaskStateReport:
         """生成状态上报"""
@@ -319,12 +429,19 @@ class TaskModel:
         # 动态导入 GS 的 TaskStateReport
         try:
             from data_class import TaskStateReport as GSTaskStateReport
+
+            # 【关键修复】remaining_samples 只报本轮可取的样本数
+            # 这样GS能正确判断是否需要分配实例：
+            # - available_samples=0 → remaining=0 → GS不分配
+            # - 进入下一轮，available变为samples_per_round → GS分配
+            current_round_available = self.sample_queue.available_samples
+
             return GSTaskStateReport(
                 task_id=self.task_id,
                 done_samples=self.done_samples,
                 done_rounds=self.done_rounds,
                 elapsed_time_sec=self._elapsed_time(),
-                remaining_samples=self.total_samples - self.done_samples,
+                remaining_samples=current_round_available,  # 只报本轮可取样本
                 current_instances=len(self.instances),
                 idle_instances=idle,
                 busy_instances=busy,
