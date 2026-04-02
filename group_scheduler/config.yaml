@@ -1,0 +1,4 @@
+acceleration_limit_ratio: 2
+catch_up_ratio: 1
+max_consecutive_reclaims: 3
+max_free_gpu_ratio: 0.3

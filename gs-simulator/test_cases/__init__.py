@@ -1,1 +1,1 @@
-"""测试用例"""
+from .benchmark import get_benchmark_cases
