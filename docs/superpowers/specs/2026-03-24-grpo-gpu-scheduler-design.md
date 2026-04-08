@@ -46,6 +46,7 @@ assert not (S_rem_i > 0 and K_i^idle > 0)
 2. 分批次小步调度
 3. 分配前最终验证
 4. 优先回收空闲实例
+5. 所有任务状态都带单调递增的 `state_version`，调度器只接受最新版本
 
 详见第7.1节详细设计。
 
@@ -67,6 +68,8 @@ assert not (S_rem_i > 0 and K_i^idle > 0)
    - 向GroupScheduler上报状态
    - 接收并执行GroupScheduler的Reclaim/Assign请求
 
+实现映射说明：issue #2 中提到的公开接口名是 `InferScheduler.revoke/assign`。本文继续沿用更抽象的 `RlxfScheduler` 命名，但接口语义以 issue #2 为准。
+
 ### 2.2 通信模式
 
 ```
@@ -78,9 +81,10 @@ GroupScheduler ──Reclaim/Assign──> RlxfScheduler
 ```
 
 **关键设计**：
-- `ReportState` 不返回调度决策，仅用于状态同步
+- `report_state` 不返回调度决策，仅用于状态同步
 - 调度决策由GroupScheduler在适当时机主动推送给任务
-- 所有消息都是异步的，通过Ray Actor handle发送
+- `reclaim` / `assign` 执行完成后，任务会返回最新的 `TaskStateReport`
+- 所有 `TaskStateReport` 都带 `state_version`，调度器丢弃旧版本状态，避免异步乱序覆盖新状态
 
 ```mermaid
 sequenceDiagram
@@ -101,13 +105,9 @@ sequenceDiagram
 
     Note over R1,GS: 正常调度流程
     par R1 上报状态（可能包含主动释放）
-        R1->>GS: report_state(TaskStateReport, [ReclaimConfirm?])
+        R1->>GS: report_state(TaskStateReport)
     and R2 上报状态
         R2->>GS: report_state(TaskStateReport)
-    end
-
-    alt 上报包含主动释放的 ReclaimConfirm
-        GS->>GS: 将释放的 GPU 加入 free_gpus
     end
 
     GS->>GS: 触发调度 trigger_scheduling()
@@ -123,10 +123,10 @@ sequenceDiagram
     alt plan 包含回收
         GS->>R1: reclaim(num_instances)
         activate R1
-        R1-->>GS: ReclaimConfirm(gpus)
+        R1-->>GS: TaskStateReport(state_version++)
         deactivate R1
 
-        GS->>GS: 更新 free_gpus<br/>处理 pending reports<br/>检查回收限制
+        GS->>GS: 用返回的最新状态更新 task table<br/>重建 free_gpus / free_workers<br/>处理 pending reports<br/>检查回收限制
 
         alt 触发新调度
             GS->>GS: trigger_scheduling()
@@ -134,19 +134,19 @@ sequenceDiagram
             GS->>GS: 重新计算分配决策
             GS->>R2: assign(placements)
             activate R2
-            R2-->>GS: (ack)
+            R2-->>GS: TaskStateReport(state_version++)
             deactivate R2
         end
     else plan 只有分配
         GS->>R2: assign(placements)
         activate R2
-        R2-->>GS: (ack)
+        R2-->>GS: TaskStateReport(state_version++)
         deactivate R2
     end
 
     Note over R1,GS: RlxfScheduler 主动释放 GPU
-    R2->>GS: report_state(..., ReclaimConfirm(gpus))
-    GS->>GS: 将主动释放的 GPU 加入 free_gpus
+    R2->>GS: report_state(TaskStateReport(state_version++))
+    GS->>GS: 基于新旧状态差异更新 free_gpus
     GS->>GS: trigger_scheduling()
 
     Note over R1,GS: 任务退出
@@ -169,10 +169,10 @@ execute(plan)
 ```
 
 **关键点**：
-- `assess_range`、`dont_starve`、`feed_more` 只计算**卡数调整量**，不涉及具体GPU放置
+- `assess_range`、`dont_starve`、`feed_more` 只计算**实例/卡数调整量**，不涉及具体GPU放置
 - `execute` 阶段处理回收和分配
-  - 如果有回收：执行回收 → 更新 `free_gpus` → **触发新的完整调度**
-  - 如果只有分配：直接执行分配
+  - 如果有回收：执行回收 → 用返回的 `TaskStateReport` 更新任务表与 `free_gpus` → **触发新的完整调度**
+  - 如果只有分配：直接执行分配，并用返回的 `TaskStateReport` 校正状态
 - 调度由每次状态上报触发，但可能决策结果是不需要调整
 
 ### 3.1 符号定义
@@ -189,8 +189,9 @@ execute(plan)
 - `S_rem_i`：剩余样本数
 
 **集群状态**：
-- `free_gpus`：调度器维护的空闲GPU表，包含具体哪台机器的哪几张卡
-  - 格式：`[(machine_id, gpu_id), ...]`
+- `free_gpus`：调度器维护的空闲worker表，底层仍对应具体机器上的GPU
+  - 逻辑格式：`[worker_id, ...]`
+  - 拓扑元数据通过 `worker_id -> WorkerInfo(machine_id, gpu_id)` 查询
 
 ---
 
@@ -338,7 +339,7 @@ def dont_starve(delta_card_ranges):
 
 ## 6. 阶段三：feed_more() - 富余卡喂给收益最大的任务
 
-如果 `excess_cards` 不为空，则选择收益最大的任务分发，分发数量可以按剩余样本量估计。
+如果 `excess_cards` 不为空，则选择收益最大的任务分发。issue #2 中收益函数已经改成基于“实例缺口指数 + 样本充足度指数”的组合评分，不再使用原来的线性打分。
 
 **注意**：这一阶段同样只计算卡数，不做具体GPU放置。
 
@@ -358,7 +359,8 @@ def feed_more(delta_card_ranges, plan, excess_cards):
             continue
 
         # 计算收益分
-        score = compute_allocation_score(task)
+        plan_num_instance = plan[i] // (task.tp * task.pp)
+        score = compute_allocation_score(task, plan_num_instance)
         if score > 0:
             task_scores.append( (-score, i) )  # 负号用于降序
 
@@ -383,7 +385,8 @@ def feed_more(delta_card_ranges, plan, excess_cards):
             excess_cards -= cards_per_instance
 
             # 如果还有收益，继续排队
-            new_score = compute_allocation_score_with_plan(task, plan[i])
+            new_plan_num_instance = plan[i] // cards_per_instance
+            new_score = compute_allocation_score(task, new_plan_num_instance)
             if new_score > 0:
                 new_current = current_cards + cards_per_instance
                 if new_current < max_allowed:
@@ -396,10 +399,14 @@ def feed_more(delta_card_ranges, plan, excess_cards):
 ### 6.1 收益评分函数
 
 ```python
-def compute_allocation_score(task):
+def compute_allocation_score(task, plan_num_instance):
     """
-    计算给任务分配一个实例的收益分数（0-100）
+    计算给任务分配实例的收益分数
+    plan_num_instance: 当前调度plan中已经计划额外分给该任务的实例数
     """
+    if not task.has_state:
+        return 0
+
     # 在训练阶段，给实例没用
     if not task.in_rollout_phase:
         return 0
@@ -408,28 +415,38 @@ def compute_allocation_score(task):
     if task.S_rem_i <= 0:
         return 0
 
+    # 基准实例数为0时直接返回0（避免除0错误）
+    if task.K_i_base <= 0:
+        return 0
+
+    weight_instances = 40
+    weight_samples = 60
+
     score = 0
 
-    # 信号1: 当前实例数 vs 基准
-    if task.K_i < task.K_i_base:
-        deficit_ratio = (task.K_i_base - task.K_i) / task.K_i_base
-        score += 50 * deficit_ratio
+    # 假设当前实例数（包含计划实例）
+    assumed_num_instance = plan_num_instance + task.K_i
 
-    # 信号2: 忙实例比例
-    if task.K_i > 0:
-        busy_ratio = task.K_i_busy / task.K_i
-        score += 30 * busy_ratio
+    # issue #2: 合并原来的信号1和信号2，改为指数实例平衡信号
+    deficit = task.K_i_base - assumed_num_instance
+    score += weight_instances * math.exp(deficit / task.K_i_base)
 
-    # 信号3: 剩余样本充足度
-    if task.K_i > 0:
-        samples_per_instance_per_round = task.S_per_round_i / task.K_i
-        if samples_per_instance_per_round > 0:
-            rounds_left = task.S_rem_i / samples_per_instance_per_round / task.K_i
-            sample_sufficiency = min(rounds_left / 5, 1.0)
-            score += 20 * sample_sufficiency
+    # issue #2: 用 remaining_samples / busy_instances 近似估计尾部完成时间
+    if task.K_i_busy > 0:
+        remaining_ratio = task.S_rem_i / task.K_i_busy
+    else:
+        remaining_ratio = task.S_rem_i * 5
+
+    total_ratio = task.total_samples / task.K_i_base
+    sample_sufficiency = remaining_ratio / total_ratio
+    score += weight_samples * math.exp(sample_sufficiency - 1.0)
 
     return score
 ```
+
+**说明**：
+- 这里显式采用 issue #2 的实现口径：实例平衡信号与忙碌比例不再分开计算，而是一起折叠进 `exp(deficit / base_instances)`。
+- `remaining_samples / busy_instances` 不是精确剩余时间预测，而是一个只依赖当前可观测状态的 proxy，用来判断“再给实例是否还有足够工作量”。
 
 ---
 
@@ -437,8 +454,8 @@ def compute_allocation_score(task):
 
 **关键洞察**：调度主要时间花在回收上（2～10秒左右），而非计算决策。因此：
 
-1. **如果plan包含回收**：检查是否达到回收限制 → 执行回收 → 更新 `free_gpus` → 决定是触发新调度还是继续做分配
-2. **如果plan只有分配**：直接执行分配
+1. **如果plan包含回收**：检查是否达到回收限制 → 执行回收 → 用返回的 `TaskStateReport` 更新状态 → 决定是触发新调度还是继续做分配
+2. **如果plan只有分配**：直接执行分配，并用返回的 `TaskStateReport` 做最终状态校正
 
 **回收限制**（安全阀）：
 - 连续回收次数超过 `max_consecutive_reclaims`（默认3），强制做分配
@@ -472,11 +489,11 @@ def execute(plan):
 
         # 并发发送回收请求，等待全部完成
         # 这是最耗时的步骤（2～10秒左右）
-        reclaimed_gpus_list = concurrent_reclaim(reclaim_tasks, timeout_sec=60.0)
+        reclaim_reports = concurrent_reclaim(reclaim_tasks, timeout_sec=60.0)
 
-        # 更新 free_gpus 表
-        for reclaimed_gpus in reclaimed_gpus_list:
-            free_gpus.extend(reclaimed_gpus)
+        # 用返回的最新 TaskStateReport 校正任务状态与 free_gpus
+        for report in reclaim_reports:
+            apply_task_state_report(report)
 
         # 处理排队的状态更新
         process_pending_state_reports()
@@ -532,17 +549,19 @@ def do_assign(plan):
                 allocation_requests.append( (i, instances_to_allocate) )
 
     # 全局优化放置
-    placements = find_best_placement_global(allocation_requests, free_gpus)
+    placements = find_best_placement_global(allocation_requests)
 
-    # 并发发送分配请求
-    concurrent_assign(placements)
-
-    # 更新 free_gpus 表
-    for (task_id, instance_placements) in placements:
-        for placement in instance_placements:
-            for (machine_id, gpu_id) in placement:
-                free_gpus.remove( (machine_id, gpu_id) )
+    # 并发发送分配请求，并使用任务返回的新状态做校正
+    assign_reports = concurrent_assign(placements)
+    for report in assign_reports:
+        apply_task_state_report(report)
 ```
+
+其中 `apply_task_state_report(report)` 的语义是：
+1. 若 `report.state_version <= last_state_version[task_id]`，丢弃该状态
+2. 否则覆盖任务最新状态
+3. 基于 `assigned_workers` 的新旧差异，重建该任务占有的资源集合
+4. 将差异同步到 `free_gpus` / `free_workers`
 
 **为什么这样设计**：
 - 架构清晰：不破坏原来的四阶段流程
@@ -563,7 +582,7 @@ def do_assign(plan):
 
 这是最有效的策略（见第7节`execute()`）：
 1. 先执行回收（这部分无法避免延迟）
-2. 回收完成后，处理所有排队的状态更新，更新 `free_gpus`
+2. 回收完成后，处理所有排队的状态更新，只接受最新 `state_version`，并更新 `free_gpus`
 3. **触发新的完整四阶段调度**（而不是在当前流程里继续做分配）
 4. 下次调度基于最新状态和刚回收的卡重新决策
 
@@ -629,7 +648,7 @@ consecutive_reclaim_count = 0
 
 ### 8.1 问题定义
 
-这是一个全局优化问题：给定一批分配需求（每个任务需要若干个`tp*pp`大小的实例），以及空闲GPU池，找到拓扑最优的放置方案。
+这是一个全局优化问题：给定一批分配需求（每个任务需要若干个`tp*pp`大小的实例），以及空闲worker池，找到拓扑最优的放置方案。
 
 **优化目标**：
 1. 最大化同一TP组内GPU的同机率
@@ -639,66 +658,83 @@ consecutive_reclaim_count = 0
 ### 8.2 全局放置算法
 
 ```python
-def find_best_placement_global(allocation_requests, free_gpus):
+def find_best_placement_global(allocation_requests):
     """
     全局优化GPU放置
 
     allocation_requests: [(task_id, num_instances), ...]
-    free_gpus: [(machine_id, gpu_id), ...]
+    free_by_machine: {machine_id: [worker_id, worker_id ...], ...}
 
     返回: [(task_id, [placement1, placement2, ...]), ...]
-           其中每个placement是[(machine_id, gpu_id), ...]，长度为tp
+           其中每个placement是[worker_id, ...]，长度为tp*pp
     """
-    # 按机器分组空闲GPU
-    free_by_machine = defaultdict(list)
-    for (machine_id, gpu_id) in free_gpus:
-        free_by_machine[machine_id].append(gpu_id)
-
     placements = []
     used_gpus = set()
+    free_by_machine = self.workers.idle_workers_per_machine
+    left_allocation_requests = []
 
     # 第一轮：优先单机器放置
     for (task_id, num_instances) in allocation_requests:
-        task = task_states[task_id]
-        tp = task.tp
+        task = self.tasks.get_task(task_id)
+        worker_per_instance = task.tp * task.pp
         instance_placements = []
 
         for _ in range(num_instances):
             # 找有足够GPU的机器
-            placed = False
             for machine_id in free_by_machine:
-                available = [g for g in free_by_machine[machine_id]
-                            if (machine_id, g) not in used_gpus]
-                if len(available) >= tp:
+                available = [worker_id for worker_id in free_by_machine[machine_id]
+                             if worker_id not in used_gpus]
+                if len(available) >= worker_per_instance:
                     # 选择这个机器
-                    selected_gpus = available[:tp]
-                    placement = [(machine_id, g) for g in selected_gpus]
-                    instance_placements.append(placement)
-                    used_gpus.update(placement)
-                    placed = True
+                    selected_gpus = available[:worker_per_instance]
+                    instance_placements.append(selected_gpus)
+                    used_gpus.update(selected_gpus)
                     break
-
-            if not placed:
-                # 单机器放置失败，留到第二轮
-                pass
+            else:
+                left_allocation_requests.append(
+                    (task_id, num_instances - len(instance_placements))
+                )
+                break
 
         placements.append( (task_id, instance_placements) )
 
     # 第二轮：处理剩余的跨机器放置
-    # ... (实现跨机器放置的启发式算法)
+    # TODO: 改进为启发式算法，尽量减少GPU碎片化
+    start = 0
+    left_idle_workers = [
+        worker_id
+        for worker_id in self.workers.idle_workers
+        if worker_id not in used_gpus
+    ]
+    for (task_id, num_instances) in left_allocation_requests:
+        task = self.tasks.get_task(task_id)
+        worker_per_instance = task.tp * task.pp
+        instance_placements = []
+        for _ in range(num_instances):
+            if start + worker_per_instance > len(left_idle_workers):
+                break
+            selected_gpus = left_idle_workers[start:start + worker_per_instance]
+            start += worker_per_instance
+            instance_placements.append(selected_gpus)
+        placements.append( (task_id, instance_placements) )
 
     return placements
 ```
+
+**说明**：
+- 这里按 issue #2 采用“先尽量单机凑满一个实例，再对剩余 worker 直接切片”的两阶段策略。
+- 当前第二轮仍是朴素枚举，没有启发式碎片整理；这一点保留为后续优化项。
 
 ---
 
 ## 9. 数据结构与接口定义
 
-### 9.1 GPU位置信息
+### 9.1 Worker / GPU位置信息
 
 ```python
 @dataclass
-class GPUPlacement:
+class WorkerInfo:
+    worker_id: str
     gpu_id: int
     machine_id: int
 ```
@@ -722,6 +758,7 @@ class TaskConfig:
 @dataclass
 class TaskStateReport:
     task_id: str
+    state_version: int  # 单调递增，只接受最新状态
 
     # 进度
     done_samples: int
@@ -737,10 +774,9 @@ class TaskStateReport:
     # 阶段
     in_rollout_phase: bool
 
-    # 主动释放的GPU（可选）
-    # 如果RlxfScheduler主动释放了某些实例（比如进入train阶段不再需要）
-    # 可以在这里附带ReclaimConfirm，调度器会将这些GPU加入free_gpus
-    voluntary_reclaim: Optional[ReclaimConfirm] = None
+    # 当前持有资源的完整快照
+    assigned_workers: List[WorkerInfo]
+    idle_worker_ids: List[str]
 ```
 
 ### 9.4 调度决策：为单个任务的分配
@@ -750,7 +786,7 @@ class TaskStateReport:
 class TaskAllocation:
     task_id: str
     instance_delta: int  # 正数=增加，负数=回收，0=不变
-    recommended_gpus: List[GPUPlacement]  # 只有分配时会填，回收时不会填
+    recommended_workers: List[WorkerInfo]  # 只有分配时会填，回收时不会填
 ```
 
 ### 9.5 调度决策
@@ -762,17 +798,7 @@ class SchedulingDecision:
     timestamp_sec: float
 ```
 
-### 9.6 任务Agent上报：回收确认
-
-```python
-@dataclass
-class ReclaimConfirm:
-    task_id: str
-    reclaimed_instances: int
-    reclaimed_gpus: List[GPUPlacement]  # 具体回收了哪些GPU
-```
-
-### 9.7 GroupScheduler Actor 接口
+### 9.6 GroupScheduler Actor 接口
 
 ```python
 class GroupScheduler:
@@ -789,7 +815,8 @@ class GroupScheduler:
         """
         任务上报状态（无返回值）
         状态更新会被排队，下次调度时统一处理
-        如果report.voluntary_reclaim不为None，调度器会将主动释放的GPU加入free_gpus
+        如果report.state_version不是最新版本，则丢弃
+        调度器通过对比assigned_workers的新旧差异更新free_gpus / free_workers
         """
         pass
 
@@ -798,23 +825,24 @@ class GroupScheduler:
         pass
 ```
 
-### 9.8 RlxfScheduler Actor 接口
+### 9.7 RlxfScheduler Actor 接口
 
 ```python
 class RlxfScheduler:
-    def reclaim(self, num_instances: int) -> ReclaimConfirm:
+    def reclaim(self, num_instances: int) -> TaskStateReport:
         """
         回收指定数量的实例
         任务必须服从，不能拒绝
-        返回具体回收了哪些GPU
+        返回执行后的最新TaskStateReport
         """
         pass
 
-    def assign(self, placements: List[List[GPUPlacement]]) -> None:
+    def assign(self, placements: List[List[str]]) -> TaskStateReport:
         """
         分配新实例
-        placements: 每个实例的GPU放置列表
+        placements: 每个实例的worker_id列表
         任务必须服从，不能拒绝
+        返回执行后的最新TaskStateReport
         """
         pass
 ```
@@ -887,8 +915,9 @@ class RlxfScheduler:
 - 按任务提交顺序或者优先级分配
 
 **RlxfScheduler 主动释放GPU**：
-- 当任务进入train阶段或不再需要某些实例时，可以在 `report_state` 时通过 `voluntary_reclaim` 字段主动释放GPU
-- 调度器收到后会将这些GPU加入 `free_gpus`，然后触发一次调度
+- 当任务进入train阶段或不再需要某些实例时，直接上报一个更新后的 `TaskStateReport(state_version++)`
+- 调度器通过比较新旧 `assigned_workers` 差异识别释放出的GPU，并更新 `free_gpus`
+- 更新成功后触发一次调度
 
 ---
 
@@ -904,6 +933,7 @@ class RlxfScheduler:
 | `scheduler.queue_pending_reports` | Gauge | 排队等待的状态报告数量 |
 | `scheduler.consecutive_reclaim_count` | Gauge | 当前连续回收次数 |
 | `scheduler.force_assign_count` | Counter | 安全阀触发强制分配的次数 |
+| `scheduler.stale_report_drop_count` | Counter | 因 `state_version` 过旧被丢弃的状态数 |
 | `cluster.gpu_total` | Gauge | 集群总GPU数 |
 | `cluster.gpu_free` | Gauge | 空闲GPU数 |
 | `cluster.gpu_free_ratio` | Gauge | 空闲GPU比例（0-1） |
@@ -961,7 +991,7 @@ class SchedulingTrace:
 
 @dataclass
 class ClusterSnapshot:
-    free_gpus: List[GPUPlacement]
+    free_gpus: List[WorkerInfo]
     task_states: List[TaskState]
 ```
 
@@ -975,7 +1005,7 @@ class GPUAllocationEvent:
     task_id: str
     event_type: str  # "assign", "reclaim", "voluntary_reclaim"
     instance_count: int
-    gpus: List[GPUPlacement]
+    workers: List[WorkerInfo]
     reason: str  # "dont_starve", "feed_more", "task_exit", "voluntary", etc.
 ```
 
