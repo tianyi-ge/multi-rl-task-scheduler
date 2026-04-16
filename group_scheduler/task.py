@@ -18,10 +18,10 @@ class TaskInfo:
         self._has_state: bool = False
 
         # 进度
-        self.done_samples: Optional[int] = None
-        self.done_rounds: Optional[int] = None
+        self.done_samples: Optional[int] = 0
+        self.done_rounds: Optional[int] = 0
         self.elapsed_time_sec: Optional[float] = None
-        self.remaining_samples: Optional[int] = None
+        self.remaining_samples: Optional[int] = self.total_samples
 
         # 当前分配
         self.current_instances: Optional[int] = 0

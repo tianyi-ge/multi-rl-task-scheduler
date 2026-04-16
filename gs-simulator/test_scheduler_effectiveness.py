@@ -14,18 +14,18 @@ Usage:
     python test_scheduler_effectiveness.py
 
     # 按索引选择
-    python test_scheduler_effectiveness.py -i 3
-    python test_scheduler_effectiveness.py --index 3
+    python test_scheduler_effectiveness.py -i 1
+    python test_scheduler_effectiveness.py --index 1
 
     # 按名称选择
-    python test_scheduler_effectiveness.py -c BB3_three_tasks_mixed_parallelism
-    python test_scheduler_effectiveness.py --case BB3_three_tasks_mixed_parallelism
+    python test_scheduler_effectiveness.py -c BB1_two_tasks_competition
+    python test_scheduler_effectiveness.py --case BB1_two_tasks_competition
 
     # 只运行无GS模式
-    python test_scheduler_effectiveness.py -i 3 --no-gs-only
+    python test_scheduler_effectiveness.py -i 1 --no-gs-only
 
     # 只运行有GS模式
-    python test_scheduler_effectiveness.py -c BB3_three_tasks_mixed_parallelism --gs-only
+    python test_scheduler_effectiveness.py -c BB1_two_tasks_competition --gs-only
 
     # 列出所有用例
     python test_scheduler_effectiveness.py --list
@@ -103,7 +103,7 @@ def select_test_case(test_cases, args) -> object:
     print("\n[选择用例]")
     print("  输入方式:")
     print("    1. 数字序号 (如: 3)")
-    print("    2. 用例名称 (如: BB3_three_tasks_mixed_parallelism)")
+    print("    2. 用例名称 (如: BB1_two_tasks_competition)")
     print("    3. 按Tab键自动补全（如果终端支持）")
 
     while True:
